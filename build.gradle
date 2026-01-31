@@ -65,3 +65,8 @@ tasks.matching { it.name == "runelitePluginHubPackage" }.configureEach {
         it.duplicatesStrategy = DuplicatesStrategy.EXCLUDE
     }
 }
+
+// Prevent signature metadata from dependencies causing Jar verification failures.
+tasks.named("jar") {
+    exclude("META-INF/*.SF", "META-INF/*.DSA", "META-INF/*.RSA")
+}
