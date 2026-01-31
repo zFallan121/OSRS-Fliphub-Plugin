@@ -172,6 +172,26 @@ public class GeLifecyclePlugin extends Plugin {
     private long lastMergedNameKey = -1L;
     private static final int MAX_LOCAL_TRADES = 5000;
     private static final long LOCAL_EVENT_BUCKET_MS = 600L;
+    private static final String[] OFFER_SETUP_BLOCKERS = new String[] {
+        "choose an item",
+        "click the icon",
+        "select an offer slot",
+        "set up or view an offer"
+    };
+    private static final String[] OFFER_TEXT_SKIP_PREFIX = new String[] {
+        "buy offer",
+        "sell offer"
+    };
+    private static final String[] ITEM_NAME_EXCLUDES = new String[] {
+        "offer status",
+        "buy offer",
+        "sell offer",
+        "quantity",
+        "price per item",
+        "coins",
+        "history",
+        "you have"
+    };
     private final Object geLimitLock = new Object();
     private final Map<Integer, Integer> geLimitCache = new HashMap<>();
     private final Set<Integer> geLimitPending = new HashSet<>();
@@ -1174,22 +1194,7 @@ public class GeLifecyclePlugin extends Plugin {
     }
 
     private Boolean findOfferTypeFromSelectedSlot() {
-        int rawSlot = client.getVarbitValue(VarbitID.GE_SELECTEDSLOT);
-        if (rawSlot <= 0) {
-            return null;
-        }
-        GrandExchangeOffer[] offers = client.getGrandExchangeOffers();
-        if (offers == null || offers.length == 0) {
-            return null;
-        }
-        int slot = rawSlot;
-        if (slot >= 1 && slot <= offers.length) {
-            slot -= 1;
-        }
-        if (slot < 0 || slot >= offers.length) {
-            return null;
-        }
-        GrandExchangeOffer offer = offers[slot];
+        GrandExchangeOffer offer = getSelectedOffer();
         if (offer == null) {
             return null;
         }
@@ -2056,8 +2061,8 @@ public class GeLifecyclePlugin extends Plugin {
     }
 
     private void updateOfferPreviewItem() {
-        Widget geRoot = client.getWidget(WidgetInfo.GRAND_EXCHANGE_WINDOW_CONTAINER);
-        boolean geOpen = geRoot != null && !geRoot.isHidden();
+        Widget geRoot = getVisibleGeRoot();
+        boolean geOpen = geRoot != null;
         boolean offerStatusOpen = geOpen && isOfferStatusOpen(geRoot);
         int newOfferType = geOpen ? client.getVarbitValue(VarbitID.GE_NEWOFFER_TYPE) : 0;
         boolean setupMode = newOfferType > 0;
@@ -2069,13 +2074,13 @@ public class GeLifecyclePlugin extends Plugin {
 
         boolean handled = setupMode ? updateOfferSetupItem() : (offerStatusOpen && updateOfferStatusItem());
         if (!handled) {
-            handled = updateOfferItemFromVarp();
+            handled = updateOfferItemFromVarp(geRoot);
         }
         if (!handled) {
-            handled = updateOfferItemFromSelectedSlot();
+            handled = updateOfferItemFromSelectedSlot(geRoot);
         }
         if (!handled && !setupMode) {
-            handled = updateOfferItemFromText();
+            handled = updateOfferItemFromText(geRoot);
         }
         if (!handled) {
             clearOfferPreview();
@@ -2094,11 +2099,7 @@ public class GeLifecyclePlugin extends Plugin {
         String normalized = normalizeOfferText(offerText != null ? offerText.getText() : null);
         if (normalized != null) {
             String lower = normalized.toLowerCase();
-            if (lower.contains("choose an item") || lower.contains("click the icon")) {
-                clearOfferPreview();
-                return true;
-            }
-            if (lower.contains("select an offer slot") || lower.contains("set up or view an offer")) {
+            if (containsAny(lower, OFFER_SETUP_BLOCKERS)) {
                 clearOfferPreview();
                 return true;
             }
@@ -2121,31 +2122,19 @@ public class GeLifecyclePlugin extends Plugin {
             clearOfferPreview();
             return true;
         }
-        if (offerPreviewItemId != null && offerPreviewItemId == itemId && offerPreviewItem != null) {
-            return true;
-        }
-        offerPreviewItemId = itemId;
-        offerPreviewName = null;
-        fetchOfferPreview(itemId);
-        return true;
+        return setOfferPreviewItem(itemId, null);
     }
 
     private boolean updateOfferStatusItem() {
-        Widget geRoot = client.getWidget(WidgetInfo.GRAND_EXCHANGE_WINDOW_CONTAINER);
-        if (geRoot == null || geRoot.isHidden()) {
+        Widget geRoot = getVisibleGeRoot();
+        if (geRoot == null) {
             return false;
         }
         int itemId = findFirstItemId(geRoot);
         if (itemId <= 0) {
             return false;
         }
-        if (offerPreviewItemId != null && offerPreviewItemId == itemId && offerPreviewItem != null) {
-            return true;
-        }
-        offerPreviewItemId = itemId;
-        offerPreviewName = null;
-        fetchOfferPreview(itemId);
-        return true;
+        return setOfferPreviewItem(itemId, null);
     }
 
     private boolean isOfferStatusOpen(Widget geRoot) {
@@ -2153,56 +2142,29 @@ public class GeLifecyclePlugin extends Plugin {
     }
 
     boolean isOfferStatusOpen() {
-        Widget geRoot = client.getWidget(WidgetInfo.GRAND_EXCHANGE_WINDOW_CONTAINER);
-        if (geRoot == null || geRoot.isHidden()) {
+        Widget geRoot = getVisibleGeRoot();
+        if (geRoot == null) {
             return false;
         }
         return isOfferStatusOpen(geRoot);
     }
 
-    private boolean updateOfferItemFromVarp() {
-        Widget geRoot = client.getWidget(WidgetInfo.GRAND_EXCHANGE_WINDOW_CONTAINER);
-        if (geRoot == null || geRoot.isHidden()) {
+    private boolean updateOfferItemFromVarp(Widget geRoot) {
+        if (geRoot == null) {
             return false;
         }
         int itemId = client.getVarpValue(VarPlayer.CURRENT_GE_ITEM);
         if (itemId <= 0) {
             return false;
         }
-        if (offerPreviewItemId != null && offerPreviewItemId == itemId && offerPreviewItem != null) {
-            return true;
-        }
-        offerPreviewItemId = itemId;
-        offerPreviewName = null;
-        fetchOfferPreview(itemId);
-        return true;
+        return setOfferPreviewItem(itemId, null);
     }
 
-    private boolean updateOfferItemFromSelectedSlot() {
-        Widget geRoot = client.getWidget(WidgetInfo.GRAND_EXCHANGE_WINDOW_CONTAINER);
-        if (geRoot == null || geRoot.isHidden()) {
+    private boolean updateOfferItemFromSelectedSlot(Widget geRoot) {
+        if (geRoot == null) {
             return false;
         }
-
-        GrandExchangeOffer[] offers = client.getGrandExchangeOffers();
-        if (offers == null || offers.length == 0) {
-            return false;
-        }
-
-        int rawSlot = client.getVarbitValue(VarbitID.GE_SELECTEDSLOT);
-        if (rawSlot <= 0) {
-            return false;
-        }
-
-        int slot = rawSlot;
-        if (slot >= 1 && slot <= offers.length) {
-            slot -= 1;
-        }
-        if (slot < 0 || slot >= offers.length) {
-            return false;
-        }
-
-        GrandExchangeOffer offer = offers[slot];
+        GrandExchangeOffer offer = getSelectedOffer();
         if (offer == null) {
             return false;
         }
@@ -2211,19 +2173,11 @@ public class GeLifecyclePlugin extends Plugin {
         if (itemId <= 0) {
             return false;
         }
-        if (offerPreviewItemId != null && offerPreviewItemId == itemId && offerPreviewItem != null) {
-            return true;
-        }
-
-        offerPreviewItemId = itemId;
-        offerPreviewName = null;
-        fetchOfferPreview(itemId);
-        return true;
+        return setOfferPreviewItem(itemId, null);
     }
 
-    private boolean updateOfferItemFromText() {
-        Widget geRoot = client.getWidget(WidgetInfo.GRAND_EXCHANGE_WINDOW_CONTAINER);
-        if (geRoot == null || geRoot.isHidden()) {
+    private boolean updateOfferItemFromText(Widget geRoot) {
+        if (geRoot == null) {
             return false;
         }
         String candidate = findItemNameCandidate(geRoot);
@@ -2234,11 +2188,18 @@ public class GeLifecyclePlugin extends Plugin {
         if (itemId <= 0) {
             return false;
         }
+        return setOfferPreviewItem(itemId, candidate);
+    }
+
+    private boolean setOfferPreviewItem(int itemId, String name) {
+        if (itemId <= 0) {
+            return false;
+        }
         if (offerPreviewItemId != null && offerPreviewItemId == itemId && offerPreviewItem != null) {
             return true;
         }
         offerPreviewItemId = itemId;
-        offerPreviewName = candidate;
+        offerPreviewName = name;
         fetchOfferPreview(itemId);
         return true;
     }
@@ -2259,10 +2220,7 @@ public class GeLifecyclePlugin extends Plugin {
                 continue;
             }
             String lower = trimmed.toLowerCase();
-            if (lower.startsWith("buy offer") || lower.startsWith("sell offer")) {
-                continue;
-            }
-            if (lower.contains("choose an item") || lower.contains("click the icon")) {
+            if (startsWithAny(lower, OFFER_TEXT_SKIP_PREFIX) || containsAny(lower, OFFER_SETUP_BLOCKERS)) {
                 continue;
             }
             candidate = trimmed;
@@ -2367,14 +2325,7 @@ public class GeLifecyclePlugin extends Plugin {
             return false;
         }
         String lower = trimmed.toLowerCase();
-        if (lower.contains("offer status") ||
-            lower.contains("buy offer") ||
-            lower.contains("sell offer") ||
-            lower.contains("quantity") ||
-            lower.contains("price per item") ||
-            lower.contains("coins") ||
-            lower.contains("history") ||
-            lower.contains("you have")) {
+        if (containsAny(lower, ITEM_NAME_EXCLUDES)) {
             return false;
         }
         boolean hasLetter = false;
@@ -2409,6 +2360,60 @@ public class GeLifecyclePlugin extends Plugin {
         } catch (Exception ignored) {
         }
         return -1;
+    }
+
+    private Widget getVisibleGeRoot() {
+        if (client == null) {
+            return null;
+        }
+        Widget geRoot = client.getWidget(WidgetInfo.GRAND_EXCHANGE_WINDOW_CONTAINER);
+        if (geRoot == null || geRoot.isHidden()) {
+            return null;
+        }
+        return geRoot;
+    }
+
+    private boolean containsAny(String lower, String[] needles) {
+        if (lower == null || needles == null) {
+            return false;
+        }
+        for (String needle : needles) {
+            if (needle != null && !needle.isEmpty() && lower.contains(needle)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean startsWithAny(String lower, String[] prefixes) {
+        if (lower == null || prefixes == null) {
+            return false;
+        }
+        for (String prefix : prefixes) {
+            if (prefix != null && !prefix.isEmpty() && lower.startsWith(prefix)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private GrandExchangeOffer getSelectedOffer() {
+        int rawSlot = client.getVarbitValue(VarbitID.GE_SELECTEDSLOT);
+        if (rawSlot <= 0) {
+            return null;
+        }
+        GrandExchangeOffer[] offers = client.getGrandExchangeOffers();
+        if (offers == null || offers.length == 0) {
+            return null;
+        }
+        int slot = rawSlot;
+        if (slot >= 1 && slot <= offers.length) {
+            slot -= 1;
+        }
+        if (slot < 0 || slot >= offers.length) {
+            return null;
+        }
+        return offers[slot];
     }
 
     private boolean widgetTreeContainsAnyText(Widget widget, String[] needlesLower) {
@@ -3040,20 +3045,13 @@ public class GeLifecyclePlugin extends Plugin {
         int end = Math.min(start + pageSize, totalItems);
         List<FlipHubItem> pageItems = start >= end ? Collections.emptyList() : items.subList(start, end);
 
-        ApiClient.ItemsResponse response = new ApiClient.ItemsResponse();
-        response.items = new ArrayList<>(pageItems);
-        response.page = page;
-        response.page_size = pageSize;
-        response.total_items = totalItems;
-        response.total_pages = totalPages;
-        response.as_of_ms = System.currentTimeMillis();
-        response.price_cache_ms = null;
-        return response;
+        return buildPagedItemsResponse(pageItems, page, pageSize, totalItems, totalPages,
+            System.currentTimeMillis(), null);
     }
 
     private ApiClient.ItemsResponse buildOfferStatusFallback() {
-        Widget geRoot = client != null ? client.getWidget(WidgetInfo.GRAND_EXCHANGE_WINDOW_CONTAINER) : null;
-        if (geRoot == null || geRoot.isHidden()) {
+        Widget geRoot = getVisibleGeRoot();
+        if (geRoot == null) {
             return emptyItemsResponse(System.currentTimeMillis(), null);
         }
         int itemId = findFirstItemId(geRoot);
@@ -3066,18 +3064,8 @@ public class GeLifecyclePlugin extends Plugin {
             return emptyItemsResponse(System.currentTimeMillis(), null);
         }
 
-        List<FlipHubItem> items = new ArrayList<>();
-        items.add(item);
-
-        ApiClient.ItemsResponse response = new ApiClient.ItemsResponse();
-        response.items = items;
-        response.page = 1;
-        response.page_size = 1;
-        response.total_items = 1;
-        response.total_pages = 1;
-        response.as_of_ms = System.currentTimeMillis();
-        response.price_cache_ms = null;
-        return response;
+        return buildPagedItemsResponse(Collections.singletonList(item), 1, 1, 1, 1,
+            System.currentTimeMillis(), null);
     }
 
     private ApiClient.ItemsResponse buildOfferStampFallback() {
@@ -3125,15 +3113,8 @@ public class GeLifecyclePlugin extends Plugin {
             return emptyItemsResponse(System.currentTimeMillis(), null);
         }
 
-        ApiClient.ItemsResponse response = new ApiClient.ItemsResponse();
-        response.items = items;
-        response.page = 1;
-        response.page_size = items.size();
-        response.total_items = items.size();
-        response.total_pages = 1;
-        response.as_of_ms = System.currentTimeMillis();
-        response.price_cache_ms = null;
-        return response;
+        int total = items.size();
+        return buildPagedItemsResponse(items, 1, total, total, 1, System.currentTimeMillis(), null);
     }
 
     private ApiClient.ItemsResponse fetchAllItems(String sessionToken, String query, int pageSize) throws Exception {
@@ -3167,19 +3148,25 @@ public class GeLifecyclePlugin extends Plugin {
     }
 
     private ApiClient.ItemsResponse buildItemsResponse(List<FlipHubItem> items, long asOfMs, Long priceCacheMs) {
-        ApiClient.ItemsResponse response = new ApiClient.ItemsResponse();
-        response.items = items;
-        response.page = 1;
-        response.page_size = items != null ? items.size() : 0;
-        response.total_items = response.page_size;
-        response.total_pages = 1;
-        response.as_of_ms = asOfMs;
-        response.price_cache_ms = priceCacheMs;
-        return response;
+        int total = items != null ? items.size() : 0;
+        return buildPagedItemsResponse(items, 1, total, total, 1, asOfMs, priceCacheMs);
     }
 
     private ApiClient.ItemsResponse emptyItemsResponse(long asOfMs, Long priceCacheMs) {
         return buildItemsResponse(Collections.emptyList(), asOfMs, priceCacheMs);
+    }
+
+    private ApiClient.ItemsResponse buildPagedItemsResponse(List<FlipHubItem> items, int page, int pageSize,
+        int totalItems, int totalPages, long asOfMs, Long priceCacheMs) {
+        ApiClient.ItemsResponse response = new ApiClient.ItemsResponse();
+        response.items = items != null ? new ArrayList<>(items) : Collections.emptyList();
+        response.page = page;
+        response.page_size = pageSize;
+        response.total_items = totalItems;
+        response.total_pages = totalPages;
+        response.as_of_ms = asOfMs;
+        response.price_cache_ms = priceCacheMs;
+        return response;
     }
 
     private Long getStatsSinceMs() {

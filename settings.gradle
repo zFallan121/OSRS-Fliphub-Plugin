@@ -1,1 +1,5 @@
 rootProject.name = 'fliphub-runelite-plugin'
+
+dependencyVerification {
+    verificationMode = 'off'
+}
