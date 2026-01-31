@@ -58,3 +58,10 @@ run {
 tasks.withType(Copy).configureEach {
     duplicatesStrategy = DuplicatesStrategy.EXCLUDE
 }
+
+// Plugin Hub packaging task needs explicit duplicate handling for META-INF/LICENSE.
+tasks.matching { it.name == "runelitePluginHubPackage" }.configureEach {
+    if (it.hasProperty("duplicatesStrategy")) {
+        it.duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    }
+}
