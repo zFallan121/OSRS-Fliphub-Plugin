@@ -738,22 +738,7 @@ public class FlipHubPanel extends PluginPanel {
         searchRow.setMaximumSize(new Dimension(Integer.MAX_VALUE, 30));
         styleTextField(statsSearchField);
         statsSearchField.setToolTipText("Filter items");
-        statsSearchField.getDocument().addDocumentListener(new javax.swing.event.DocumentListener() {
-            @Override
-            public void insertUpdate(javax.swing.event.DocumentEvent e) {
-                updateStatsSearch();
-            }
-
-            @Override
-            public void removeUpdate(javax.swing.event.DocumentEvent e) {
-                updateStatsSearch();
-            }
-
-            @Override
-            public void changedUpdate(javax.swing.event.DocumentEvent e) {
-                updateStatsSearch();
-            }
-        });
+        installDocumentListener(statsSearchField, this::updateStatsSearch);
 
         statsClearButton.setFocusPainted(false);
         statsClearButton.setFont(fontSemiBold(10.5f));
@@ -788,15 +773,21 @@ public class FlipHubPanel extends PluginPanel {
         statsContentPanel.add(Box.createVerticalStrut(6));
 
         statsRoiValue = new JLabel("0.00%");
-        statsContentPanel.add(buildStatsRow("ROI", statsRoiValue, TEXT));
         statsFlipsValue = new JLabel("0");
-        statsContentPanel.add(buildStatsRow("Total Flips Made", statsFlipsValue, TEXT));
         statsTaxValue = new JLabel("0 gp");
-        statsContentPanel.add(buildStatsRow("Tax paid", statsTaxValue, TEXT));
         statsSessionTimeValue = new JLabel("00:00:00");
-        statsContentPanel.add(buildStatsRow("Session Time", statsSessionTimeValue, TEXT));
         statsHourlyValue = new JLabel("0 gp/hr");
-        statsContentPanel.add(buildStatsRow("Hourly Profit", statsHourlyValue, SUCCESS));
+
+        Object[][] rows = new Object[][]{
+            {"ROI", statsRoiValue, TEXT},
+            {"Total Flips Made", statsFlipsValue, TEXT},
+            {"Tax paid", statsTaxValue, TEXT},
+            {"Session Time", statsSessionTimeValue, TEXT},
+            {"Hourly Profit", statsHourlyValue, SUCCESS}
+        };
+        for (Object[] row : rows) {
+            statsContentPanel.add(buildStatsRow((String) row[0], (JLabel) row[1], (Color) row[2]));
+        }
 
         statsContentPanel.add(Box.createVerticalStrut(10));
         statsContentPanel.add(buildStatsSortRow());
@@ -1064,13 +1055,18 @@ public class FlipHubPanel extends PluginPanel {
         card.add(instaSellLine.row);
         card.add(instaBuyLine.row);
         registerAgePair(item.instabuy_ts_ms, item.instasell_ts_ms, instaBuyLine, instaSellLine);
-        card.add(buildLine("Last sell price", formatGp(item.last_sell_price), TEXT, rightPadding));
-        card.add(buildLine("Last buy price", formatGp(item.last_buy_price), TEXT, rightPadding));
-        card.add(buildLine("Margin", formatGp(item.margin), WARNING, rightPadding));
-        card.add(buildLine("Margin x limit", formatGp(item.margin_x_limit), WARNING, rightPadding));
         Color roiColor = item.roi_percent != null && item.roi_percent < 0 ? DANGER : TEXT;
-        card.add(buildLine("ROI", formatPercent(item.roi_percent), roiColor, rightPadding));
-        card.add(buildLine("GE limit remaining", formatLimit(item.ge_limit_remaining, item.ge_limit_total), TEXT, rightPadding));
+        Object[][] lines = new Object[][]{
+            {"Last sell price", formatGp(item.last_sell_price), TEXT},
+            {"Last buy price", formatGp(item.last_buy_price), TEXT},
+            {"Margin", formatGp(item.margin), WARNING},
+            {"Margin x limit", formatGp(item.margin_x_limit), WARNING},
+            {"ROI", formatPercent(item.roi_percent), roiColor},
+            {"GE limit remaining", formatLimit(item.ge_limit_remaining, item.ge_limit_total), TEXT}
+        };
+        for (Object[] line : lines) {
+            card.add(buildLine((String) line[0], (String) line[1], (Color) line[2], rightPadding));
+        }
         Long resetMs = item.ge_limit_reset_ms;
         if (item.ge_limit_total != null && item.ge_limit_total > 0
             && item.ge_limit_remaining != null
@@ -1084,16 +1080,8 @@ public class FlipHubPanel extends PluginPanel {
         return card;
     }
 
-    private JPanel buildLine(String label, String value, Color valueColor) {
-        return buildLineComponents(label, value, valueColor, VALUE_RIGHT_PADDING).row;
-    }
-
     private JPanel buildLine(String label, String value, Color valueColor, int rightPadding) {
         return buildLineComponents(label, value, valueColor, rightPadding).row;
-    }
-
-    private LineComponents buildLineComponents(String label, String value, Color valueColor) {
-        return buildLineComponents(label, value, valueColor, VALUE_RIGHT_PADDING);
     }
 
     private LineComponents buildLineComponents(String label, String value, Color valueColor, int rightPadding) {
@@ -1164,10 +1152,6 @@ public class FlipHubPanel extends PluginPanel {
         }
         SwingUtilities.convertPointFromScreen(pointer, iconLayer);
         removeButton.setVisible(iconLayer.contains(pointer));
-    }
-
-    private JPanel buildCountdownLine(String label, Long remainingMs, long asOfMs, Color valueColor) {
-        return buildCountdownLine(label, remainingMs, asOfMs, valueColor, VALUE_RIGHT_PADDING);
     }
 
     private JPanel buildCountdownLine(String label, Long remainingMs, long asOfMs, Color valueColor, int rightPadding) {
@@ -1321,20 +1305,24 @@ public class FlipHubPanel extends PluginPanel {
     }
 
     private void hookSearchListener() {
-        searchField.getDocument().addDocumentListener(new javax.swing.event.DocumentListener() {
+        installDocumentListener(searchField, this::scheduleSearch);
+    }
+
+    private void installDocumentListener(JTextField field, Runnable onChange) {
+        field.getDocument().addDocumentListener(new javax.swing.event.DocumentListener() {
             @Override
             public void insertUpdate(javax.swing.event.DocumentEvent e) {
-                scheduleSearch();
+                onChange.run();
             }
 
             @Override
             public void removeUpdate(javax.swing.event.DocumentEvent e) {
-                scheduleSearch();
+                onChange.run();
             }
 
             @Override
             public void changedUpdate(javax.swing.event.DocumentEvent e) {
-                scheduleSearch();
+                onChange.run();
             }
         });
     }
@@ -1380,11 +1368,7 @@ public class FlipHubPanel extends PluginPanel {
             listPanel.add(buildSectionHeader("Offer setup"));
             listPanel.add(buildItemCard(offerPreviewItem, offerAsOfMs, true));
         } else if (lastItems == null || lastItems.isEmpty()) {
-            if (showBookmarkedOnly) {
-                listPanel.add(buildCard("No bookmarks", "Bookmark items to pin them here."));
-            } else {
-                listPanel.add(buildCard("No flip history", "Make a trade to see your items here."));
-            }
+            listPanel.add(buildEmptyStateCard());
         } else if (showBookmarkedOnly) {
             List<FlipHubItem> itemsToShow = new ArrayList<>();
             for (FlipHubItem item : lastItems) {
@@ -1393,23 +1377,14 @@ public class FlipHubPanel extends PluginPanel {
                 }
             }
             if (itemsToShow.isEmpty()) {
-                listPanel.add(buildCard("No bookmarks", "Bookmark items to pin them here."));
+                listPanel.add(buildEmptyStateCard());
             } else {
                 listPanel.add(buildSectionHeader("Bookmarked items"));
                 listPanel.add(Box.createVerticalStrut(6));
-                for (FlipHubItem item : itemsToShow) {
-                    listPanel.add(buildItemCard(item, lastAsOfMs, false));
-                    listPanel.add(Box.createVerticalStrut(8));
-                }
+                addItemCards(itemsToShow, lastAsOfMs);
             }
         } else {
-            for (FlipHubItem item : lastItems) {
-                if (isHidden(item.item_id)) {
-                    continue;
-                }
-                listPanel.add(buildItemCard(item, lastAsOfMs, false));
-                listPanel.add(Box.createVerticalStrut(8));
-            }
+            addItemCards(lastItems, lastAsOfMs);
         }
 
         long refreshAsOf = lastAsOfMs > 0 ? lastAsOfMs : offerAsOfMs;
@@ -1433,40 +1408,63 @@ public class FlipHubPanel extends PluginPanel {
         listPanel.repaint();
     }
 
+    private JComponent buildEmptyStateCard() {
+        return showBookmarkedOnly
+            ? buildCard("No bookmarks", "Bookmark items to pin them here.")
+            : buildCard("No flip history", "Make a trade to see your items here.");
+    }
+
+    private void addItemCards(List<FlipHubItem> items, long asOfMs) {
+        if (items == null) {
+            return;
+        }
+        for (FlipHubItem item : items) {
+            if (item == null || isHidden(item.item_id)) {
+                continue;
+            }
+            listPanel.add(buildItemCard(item, asOfMs, false));
+            listPanel.add(Box.createVerticalStrut(8));
+        }
+    }
+
     private void updateStatsSummary() {
         if (statsTotalProfitValue == null || statsRoiValue == null) {
             return;
         }
         if (statsSummary == null) {
-            statsTotalProfitValue.setText("0 gp");
-            statsTotalProfitValue.setForeground(WARNING);
-            statsRoiValue.setText("0.00%");
-            statsRoiValue.setForeground(TEXT);
-            statsFlipsValue.setText("0");
-            statsTaxValue.setText("0 gp");
-            statsSessionTimeValue.setText("00:00:00");
-            statsHourlyValue.setText("0 gp/hr");
-            statsHourlyValue.setForeground(SUCCESS);
+            setLabel(statsTotalProfitValue, "0 gp", WARNING);
+            setLabel(statsRoiValue, "0.00%", TEXT);
+            setLabel(statsFlipsValue, "0", null);
+            setLabel(statsTaxValue, "0 gp", null);
+            setLabel(statsSessionTimeValue, "00:00:00", null);
+            setLabel(statsHourlyValue, "0 gp/hr", SUCCESS);
             return;
         }
 
         long totalProfit = statsSummary.total_profit_gp != null ? statsSummary.total_profit_gp : 0;
-        statsTotalProfitValue.setText(formatGp(totalProfit));
-        statsTotalProfitValue.setForeground(totalProfit >= 0 ? WARNING : DANGER);
+        setLabel(statsTotalProfitValue, formatGp(totalProfit), totalProfit >= 0 ? WARNING : DANGER);
 
         Double roi = statsSummary.roi_percent;
-        statsRoiValue.setText(formatPercent(roi));
-        statsRoiValue.setForeground(roi != null && roi < 0 ? DANGER : TEXT);
+        setLabel(statsRoiValue, formatPercent(roi), roi != null && roi < 0 ? DANGER : TEXT);
 
         int flips = statsSummary.fill_count != null ? statsSummary.fill_count : 0;
-        statsFlipsValue.setText(String.valueOf(flips));
+        setLabel(statsFlipsValue, String.valueOf(flips), null);
 
-        statsTaxValue.setText(formatGp(statsSummary.tax_paid_gp));
-        statsSessionTimeValue.setText(formatDuration(statsSummary.active_ms));
+        setLabel(statsTaxValue, formatGp(statsSummary.tax_paid_gp), null);
+        setLabel(statsSessionTimeValue, formatDuration(statsSummary.active_ms), null);
 
         Double gpPerHour = statsSummary.gp_per_hour;
-        statsHourlyValue.setText(formatGpPerHour(gpPerHour));
-        statsHourlyValue.setForeground(gpPerHour != null && gpPerHour < 0 ? DANGER : SUCCESS);
+        setLabel(statsHourlyValue, formatGpPerHour(gpPerHour), gpPerHour != null && gpPerHour < 0 ? DANGER : SUCCESS);
+    }
+
+    private void setLabel(JLabel label, String text, Color color) {
+        if (label == null) {
+            return;
+        }
+        label.setText(text);
+        if (color != null) {
+            label.setForeground(color);
+        }
     }
 
     private void renderStatsItems() {
