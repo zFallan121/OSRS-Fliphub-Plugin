@@ -57,6 +57,7 @@ run {
 // Avoid duplicate META-INF entries during plugin-hub packaging.
 tasks.withType(Copy).configureEach {
     duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    exclude("META-INF/*.SF", "META-INF/*.DSA", "META-INF/*.RSA")
 }
 
 // Plugin Hub packaging task needs explicit duplicate handling for META-INF/LICENSE.
@@ -67,6 +68,6 @@ tasks.matching { it.name == "runelitePluginHubPackage" }.configureEach {
 }
 
 // Prevent signature metadata from dependencies causing Jar verification failures.
-tasks.named("jar") {
+tasks.withType(AbstractArchiveTask).configureEach {
     exclude("META-INF/*.SF", "META-INF/*.DSA", "META-INF/*.RSA")
 }
