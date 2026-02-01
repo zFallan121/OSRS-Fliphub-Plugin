@@ -44,7 +44,7 @@ import net.runelite.api.gameval.VarClientID;
 import net.runelite.api.gameval.VarbitID;
 import net.runelite.api.widgets.JavaScriptCallback;
 import net.runelite.api.widgets.Widget;
-import net.runelite.api.widgets.WidgetInfo;
+import net.runelite.api.widgets.ComponentID;
 import net.runelite.api.widgets.WidgetPositionMode;
 import net.runelite.api.widgets.WidgetSizeMode;
 import net.runelite.api.widgets.WidgetTextAlignment;
@@ -199,9 +199,6 @@ public class GeLifecyclePlugin extends Plugin {
     private final Map<Integer, WikiPriceEntry> wikiLatestCache = new HashMap<>();
     private volatile long wikiLatestFetchedMs;
     private final AtomicBoolean wikiFetchInFlight = new AtomicBoolean(false);
-    private final OkHttpClient wikiHttpClient = new OkHttpClient.Builder()
-        .callTimeout(10, TimeUnit.SECONDS)
-        .build();
     private GeOfferTimerOverlay offerTimerOverlay;
 
     @Provides
@@ -670,7 +667,7 @@ public class GeLifecyclePlugin extends Plugin {
             clearLimitSuggestion();
             return;
         }
-        Widget geRoot = client.getWidget(WidgetInfo.GRAND_EXCHANGE_WINDOW_CONTAINER);
+        Widget geRoot = client.getWidget(ComponentID.GRAND_EXCHANGE_WINDOW_CONTAINER);
         if (geRoot == null || geRoot.isHidden()) {
             clearPriceSuggestion();
             clearLimitSuggestion();
@@ -771,28 +768,28 @@ public class GeLifecyclePlugin extends Plugin {
         if (isPromptWidgetValid(cachedPricePromptWidget, true)) {
             return cachedPricePromptWidget;
         }
-        Widget fullInput = client.getWidget(WidgetInfo.CHATBOX_FULL_INPUT);
+        Widget fullInput = client.getWidget(ComponentID.CHATBOX_FULL_INPUT);
         if (isPricePromptWidget(fullInput)) {
             cachedPricePromptWidget = fullInput;
             return fullInput;
         }
-        Widget title = client.getWidget(WidgetInfo.CHATBOX_TITLE);
+        Widget title = client.getWidget(ComponentID.CHATBOX_TITLE);
         if (isPricePromptWidget(title)) {
             cachedPricePromptWidget = title;
             return title;
         }
-        Widget firstLine = client.getWidget(WidgetInfo.CHATBOX_FIRST_MESSAGE);
+        Widget firstLine = client.getWidget(ComponentID.CHATBOX_FIRST_MESSAGE);
         if (isPricePromptWidget(firstLine)) {
             cachedPricePromptWidget = firstLine;
             return firstLine;
         }
-        Widget messageLines = client.getWidget(WidgetInfo.CHATBOX_MESSAGE_LINES);
+        Widget messageLines = client.getWidget(ComponentID.CHATBOX_MESSAGE_LINES);
         Widget found = findPricePromptWidget(messageLines);
         if (found != null) {
             cachedPricePromptWidget = found;
             return found;
         }
-        Widget container = client.getWidget(WidgetInfo.CHATBOX_CONTAINER);
+        Widget container = client.getWidget(ComponentID.CHATBOX_CONTAINER);
         found = findPricePromptWidget(container);
         cachedPricePromptWidget = found;
         return found;
@@ -802,28 +799,28 @@ public class GeLifecyclePlugin extends Plugin {
         if (isPromptWidgetValid(cachedQuantityPromptWidget, false)) {
             return cachedQuantityPromptWidget;
         }
-        Widget fullInput = client.getWidget(WidgetInfo.CHATBOX_FULL_INPUT);
+        Widget fullInput = client.getWidget(ComponentID.CHATBOX_FULL_INPUT);
         if (isQuantityPromptWidget(fullInput)) {
             cachedQuantityPromptWidget = fullInput;
             return fullInput;
         }
-        Widget title = client.getWidget(WidgetInfo.CHATBOX_TITLE);
+        Widget title = client.getWidget(ComponentID.CHATBOX_TITLE);
         if (isQuantityPromptWidget(title)) {
             cachedQuantityPromptWidget = title;
             return title;
         }
-        Widget firstLine = client.getWidget(WidgetInfo.CHATBOX_FIRST_MESSAGE);
+        Widget firstLine = client.getWidget(ComponentID.CHATBOX_FIRST_MESSAGE);
         if (isQuantityPromptWidget(firstLine)) {
             cachedQuantityPromptWidget = firstLine;
             return firstLine;
         }
-        Widget messageLines = client.getWidget(WidgetInfo.CHATBOX_MESSAGE_LINES);
+        Widget messageLines = client.getWidget(ComponentID.CHATBOX_MESSAGE_LINES);
         Widget found = findQuantityPromptWidget(messageLines);
         if (found != null) {
             cachedQuantityPromptWidget = found;
             return found;
         }
-        Widget container = client.getWidget(WidgetInfo.CHATBOX_CONTAINER);
+        Widget container = client.getWidget(ComponentID.CHATBOX_CONTAINER);
         found = findQuantityPromptWidget(container);
         cachedQuantityPromptWidget = found;
         return found;
@@ -840,19 +837,19 @@ public class GeLifecyclePlugin extends Plugin {
         if (client == null) {
             return false;
         }
-        Widget fullInput = client.getWidget(WidgetInfo.CHATBOX_FULL_INPUT);
+        Widget fullInput = client.getWidget(ComponentID.CHATBOX_FULL_INPUT);
         if (isWidgetVisible(fullInput)) {
             return true;
         }
-        Widget input = client.getWidget(WidgetInfo.CHATBOX_INPUT);
+        Widget input = client.getWidget(ComponentID.CHATBOX_INPUT);
         if (isWidgetVisible(input)) {
             return true;
         }
-        Widget title = client.getWidget(WidgetInfo.CHATBOX_TITLE);
+        Widget title = client.getWidget(ComponentID.CHATBOX_TITLE);
         if (isWidgetVisible(title) && (isPricePromptWidget(title) || isQuantityPromptWidget(title))) {
             return true;
         }
-        Widget firstLine = client.getWidget(WidgetInfo.CHATBOX_FIRST_MESSAGE);
+        Widget firstLine = client.getWidget(ComponentID.CHATBOX_FIRST_MESSAGE);
         return isWidgetVisible(firstLine) && (isPricePromptWidget(firstLine) || isQuantityPromptWidget(firstLine));
     }
 
@@ -861,11 +858,11 @@ public class GeLifecyclePlugin extends Plugin {
     }
 
     private Widget getChatboxContainer() {
-        Widget container = client.getWidget(WidgetInfo.CHATBOX_CONTAINER);
+        Widget container = client.getWidget(ComponentID.CHATBOX_CONTAINER);
         if (container != null) {
             return container;
         }
-        return client.getWidget(WidgetInfo.CHATBOX_PARENT);
+        return client.getWidget(ComponentID.CHATBOX_PARENT);
     }
 
     private Widget findPricePromptWidget(Widget root) {
@@ -967,8 +964,8 @@ public class GeLifecyclePlugin extends Plugin {
         int suggestionHeight = 16;
         int yBelow = anchorY + anchorHeight + 2;
         int yAbove = Math.max(2, anchorY - suggestionHeight - 2);
-        boolean anchorIsInput = anchor.getId() == WidgetInfo.CHATBOX_FULL_INPUT.getId()
-            || anchor.getId() == WidgetInfo.CHATBOX_INPUT.getId();
+        boolean anchorIsInput = anchor.getId() == ComponentID.CHATBOX_FULL_INPUT
+            || anchor.getId() == ComponentID.CHATBOX_INPUT;
         int containerHeight = getWidgetHeight(container, 0);
         int y = anchorIsInput ? yAbove : yBelow;
         if (containerHeight > 0 && y + suggestionHeight > containerHeight) {
@@ -1146,12 +1143,12 @@ public class GeLifecyclePlugin extends Plugin {
     }
 
     private Boolean findOfferTypeFromSetupWidgets() {
-        Widget offerText = client.getWidget(WidgetInfo.GRAND_EXCHANGE_OFFER_TEXT);
+        Widget offerText = client.getWidget(ComponentID.GRAND_EXCHANGE_OFFER_TEXT);
         Boolean fromOfferText = findOfferTypeInWidget(offerText);
         if (fromOfferText != null) {
             return fromOfferText;
         }
-        Widget offerContainer = client.getWidget(WidgetInfo.GRAND_EXCHANGE_OFFER_CONTAINER);
+        Widget offerContainer = client.getWidget(ComponentID.GRAND_EXCHANGE_OFFER_CONTAINER);
         return findOfferTypeInWidget(offerContainer);
     }
 
@@ -1247,7 +1244,7 @@ public class GeLifecyclePlugin extends Plugin {
     }
 
     private Boolean findOfferTypeFromGeRoot() {
-        Widget geRoot = client.getWidget(WidgetInfo.GRAND_EXCHANGE_WINDOW_CONTAINER);
+        Widget geRoot = client.getWidget(ComponentID.GRAND_EXCHANGE_WINDOW_CONTAINER);
         if (geRoot == null || geRoot.isHidden()) {
             return null;
         }
@@ -2088,8 +2085,8 @@ public class GeLifecyclePlugin extends Plugin {
     }
 
     private boolean updateOfferSetupItem() {
-        Widget offerContainer = client.getWidget(WidgetInfo.GRAND_EXCHANGE_OFFER_CONTAINER);
-        Widget offerText = client.getWidget(WidgetInfo.GRAND_EXCHANGE_OFFER_TEXT);
+        Widget offerContainer = client.getWidget(ComponentID.GRAND_EXCHANGE_OFFER_CONTAINER);
+        Widget offerText = client.getWidget(ComponentID.GRAND_EXCHANGE_OFFER_TEXT);
         boolean offerVisible = (offerText != null && !offerText.isHidden()) ||
             (offerContainer != null && !offerContainer.isHidden());
         if (!offerVisible) {
@@ -2366,7 +2363,7 @@ public class GeLifecyclePlugin extends Plugin {
         if (client == null) {
             return null;
         }
-        Widget geRoot = client.getWidget(WidgetInfo.GRAND_EXCHANGE_WINDOW_CONTAINER);
+        Widget geRoot = client.getWidget(ComponentID.GRAND_EXCHANGE_WINDOW_CONTAINER);
         if (geRoot == null || geRoot.isHidden()) {
             return null;
         }
@@ -4293,7 +4290,7 @@ public class GeLifecyclePlugin extends Plugin {
                 .addHeader("User-Agent", WIKI_USER_AGENT)
                 .addHeader("Accept", "application/json")
                 .build();
-            try (Response response = wikiHttpClient.newCall(request).execute()) {
+            try (Response response = httpClient.newCall(request).execute()) {
                 if (!response.isSuccessful()) {
                     return;
                 }
@@ -4450,3 +4447,4 @@ public class GeLifecyclePlugin extends Plugin {
         }
     }
 }
+

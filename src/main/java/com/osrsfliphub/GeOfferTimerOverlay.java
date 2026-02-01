@@ -14,8 +14,8 @@ import net.runelite.api.GrandExchangeOffer;
 import net.runelite.api.GrandExchangeOfferState;
 import net.runelite.api.Point;
 import net.runelite.api.widgets.Widget;
-import net.runelite.api.widgets.WidgetInfo;
-import net.runelite.api.widgets.WidgetID;
+import net.runelite.api.widgets.ComponentID;
+import net.runelite.api.widgets.InterfaceID;
 import net.runelite.client.ui.FontManager;
 import net.runelite.client.ui.overlay.Overlay;
 import net.runelite.client.ui.overlay.OverlayLayer;
@@ -69,15 +69,15 @@ public class GeOfferTimerOverlay extends Overlay {
         if (client == null) {
             return null;
         }
-        Widget geRoot = client.getWidget(WidgetInfo.GRAND_EXCHANGE_WINDOW_CONTAINER);
+        Widget geRoot = client.getWidget(ComponentID.GRAND_EXCHANGE_WINDOW_CONTAINER);
         if (geRoot == null || geRoot.isHidden()) {
             return null;
         }
-        Widget offerContainer = client.getWidget(WidgetInfo.GRAND_EXCHANGE_OFFER_CONTAINER);
+        Widget offerContainer = client.getWidget(ComponentID.GRAND_EXCHANGE_OFFER_CONTAINER);
         if (offerContainer != null && !offerContainer.isHidden()) {
             return null;
         }
-        Widget offerText = client.getWidget(WidgetInfo.GRAND_EXCHANGE_OFFER_TEXT);
+        Widget offerText = client.getWidget(ComponentID.GRAND_EXCHANGE_OFFER_TEXT);
         if (offerText != null && !offerText.isHidden()) {
             return null;
         }
@@ -346,7 +346,7 @@ public class GeOfferTimerOverlay extends Overlay {
         if (client == null) {
             return results;
         }
-        int groupId = WidgetID.GRAND_EXCHANGE_GROUP_ID;
+        int groupId = InterfaceID.GRAND_EXCHANGE;
         for (int component = 0; component <= SLOT_SCAN_COMPONENT_LIMIT; component++) {
             Widget widget = client.getWidget(groupId, component);
             if (widget == null || widget.isHidden()) {
@@ -455,3 +455,5 @@ public class GeOfferTimerOverlay extends Overlay {
     }
 
 }
+
+
