@@ -42,7 +42,9 @@ import javax.swing.JComponent;
 import javax.swing.JComboBox;
 import javax.swing.JLabel;
 import javax.swing.JLayeredPane;
+import javax.swing.JMenuItem;
 import javax.swing.JPanel;
+import javax.swing.JPopupMenu;
 import javax.swing.JScrollPane;
 import javax.swing.Scrollable;
 import javax.swing.JTextField;
@@ -86,6 +88,8 @@ public class FlipHubPanel extends PluginPanel {
     static final Color SUCCESS = new Color(34, 197, 94);
     static final Color WARNING = new Color(245, 158, 11);
     static final Color DANGER = new Color(244, 63, 94);
+    private static final DateTimeFormatter REFRESH_TIME_FORMATTER =
+        DateTimeFormatter.ofPattern("HH:mm:ss").withZone(ZoneId.systemDefault());
     static final int VALUE_RIGHT_PADDING = 4;
     static final int OFFER_VALUE_RIGHT_PADDING = 4;
     static final int SCROLL_UNIT_INCREMENT = 64;
@@ -104,6 +108,7 @@ public class FlipHubPanel extends PluginPanel {
         void onBookmarkFilterChanged(boolean enabled);
         void onStatsRangeChanged(StatsRange range);
         void onStatsSortChanged(StatsItemSort sort);
+        void onProfileSelected(String profileKey);
     }
 
     interface BookmarkStore {
@@ -122,7 +127,7 @@ public class FlipHubPanel extends PluginPanel {
     private final JToggleButton statsTab = new JToggleButton("Flip Profile");
     private final JTextField searchField = new JTextField();
     private final JLabel refreshLabel = new JLabel("Updated: --");
-    private final JLabel statusLabel = new JLabel("Status: Not linked");
+    private final JButton profileButton = new JButton("Accountwide");
     private final JLabel pageLabel = new JLabel("Page 0 of 0");
     private final JButton prevButton = new JButton("<");
     private final JButton nextButton = new JButton(">");
@@ -174,6 +179,18 @@ public class FlipHubPanel extends PluginPanel {
     private int hoveredAgeY;
     private Popup ageTooltipPopup;
     private JToolTip ageTooltip;
+    private JPopupMenu profileMenu;
+    private String selectedProfileKey;
+
+    static final class ProfileOption {
+        final String key;
+        final String label;
+
+        ProfileOption(String key, String label) {
+            this.key = key;
+            this.label = label;
+        }
+    }
 
     private static final class CountdownEntry {
         private final JLabel label;
@@ -459,13 +476,18 @@ public class FlipHubPanel extends PluginPanel {
         title.setForeground(TEXT);
         title.setFont(fontBold(15f));
 
-        statusLabel.setForeground(MUTED);
-        statusLabel.setFont(font(10.5f));
-        statusLabel.setBorder(new EmptyBorder(2, 2, 2, 2));
+        profileButton.setForeground(MUTED);
+        profileButton.setFont(font(10.5f));
+        profileButton.setBorder(new EmptyBorder(2, 6, 2, 6));
+        profileButton.setContentAreaFilled(false);
+        profileButton.setFocusPainted(false);
+        profileButton.setOpaque(false);
+        profileButton.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        profileButton.addActionListener(e -> showProfileMenu());
 
         JPanel statusWrap = new JPanel(new FlowLayout(FlowLayout.RIGHT, 6, 0));
         statusWrap.setOpaque(false);
-        statusWrap.add(statusLabel);
+        statusWrap.add(profileButton);
 
         header.add(title, BorderLayout.WEST);
         header.add(statusWrap, BorderLayout.EAST);
@@ -638,8 +660,8 @@ public class FlipHubPanel extends PluginPanel {
         refreshLabel.setForeground(MUTED);
         refreshLabel.setFont(font(10.5f));
 
-        statusLabel.setForeground(MUTED);
-        statusLabel.setFont(font(10.5f));
+        profileButton.setForeground(MUTED);
+        profileButton.setFont(font(10.5f));
 
         JPanel top = new JPanel();
         top.setBackground(BG);
@@ -875,9 +897,7 @@ public class FlipHubPanel extends PluginPanel {
     void setStatsSummary(StatsSummary summary, long asOfMs) {
         SwingUtilities.invokeLater(() -> {
             statsSummary = summary;
-            if (asOfMs > 0) {
-                statsUpdatedLabel.setText(buildRefreshText(asOfMs, null));
-            }
+            updateStatsUpdatedLabel(asOfMs);
             updateStatsSummary();
         });
     }
@@ -885,9 +905,7 @@ public class FlipHubPanel extends PluginPanel {
     void setStatsItems(List<StatsItem> items, long asOfMs) {
         SwingUtilities.invokeLater(() -> {
             statsItems = items != null ? items : new ArrayList<>();
-            if (asOfMs > 0) {
-                statsUpdatedLabel.setText(buildRefreshText(asOfMs, null));
-            }
+            updateStatsUpdatedLabel(asOfMs);
             renderStatsItems();
         });
     }
@@ -916,7 +934,35 @@ public class FlipHubPanel extends PluginPanel {
     }
 
     void setStatusMessage(String message) {
-        SwingUtilities.invokeLater(() -> statusLabel.setText(message));
+        SwingUtilities.invokeLater(() -> profileButton.setText(message));
+    }
+
+    void setProfileHeader(String label, boolean linked) {
+        SwingUtilities.invokeLater(() -> {
+            profileButton.setText(label != null ? label : "");
+            profileButton.setForeground(linked ? SUCCESS : MUTED);
+        });
+    }
+
+    void setProfileOptions(List<ProfileOption> options, String selectedKey) {
+        SwingUtilities.invokeLater(() -> {
+            selectedProfileKey = selectedKey;
+            rebuildProfileMenu(options);
+        });
+    }
+
+    private void updateStatsUpdatedLabel(long asOfMs) {
+        if (asOfMs > 0) {
+            statsUpdatedLabel.setText(buildRefreshText(asOfMs, null));
+        }
+    }
+
+
+    private void showProfileMenu() {
+        if (profileMenu == null || profileMenu.getComponentCount() == 0) {
+            return;
+        }
+        profileMenu.show(profileButton, 0, profileButton.getHeight() + 2);
     }
 
     private JPanel buildCard(String title, String body) {
@@ -938,6 +984,37 @@ public class FlipHubPanel extends PluginPanel {
         card.add(Box.createVerticalStrut(4));
         card.add(bodyLabel);
         return card;
+    }
+
+    private void rebuildProfileMenu(List<ProfileOption> options) {
+        if (options == null || options.isEmpty()) {
+            profileMenu = null;
+            return;
+        }
+        profileMenu = new JPopupMenu();
+        for (ProfileOption option : options) {
+            String label = option != null ? option.label : null;
+            String key = option != null ? option.key : null;
+            if (label == null || key == null) {
+                continue;
+            }
+            JMenuItem item = new JMenuItem(label);
+            item.setFont(font(11f));
+            item.setForeground(TEXT);
+            item.setBackground(BG_ALT);
+            item.setOpaque(true);
+            if (selectedProfileKey != null && selectedProfileKey.equals(key)) {
+                item.setFont(fontSemiBold(11f));
+                item.setForeground(ACCENT);
+            }
+            item.addActionListener(e -> {
+                selectedProfileKey = key;
+                if (listener != null) {
+                    listener.onProfileSelected(key);
+                }
+            });
+            profileMenu.add(item);
+        }
     }
 
     private JPanel buildStatsBlock(String label, JLabel valueView, Color valueColor) {
@@ -1247,16 +1324,14 @@ public class FlipHubPanel extends PluginPanel {
         if (value == null) {
             return "N/A";
         }
-        NumberFormat formatter = NumberFormat.getIntegerInstance(Locale.US);
-        return formatter.format(value) + " gp";
+        return formatGpValue(value.longValue());
     }
 
     private String formatGp(Long value) {
         if (value == null) {
             return "N/A";
         }
-        NumberFormat formatter = NumberFormat.getIntegerInstance(Locale.US);
-        return formatter.format(value) + " gp";
+        return formatGpValue(value);
     }
 
     private String formatPercent(Double value) {
@@ -1271,8 +1346,16 @@ public class FlipHubPanel extends PluginPanel {
             return "N/A";
         }
         long rounded = Math.round(value);
+        return formatNumber(rounded) + " gp/hr";
+    }
+
+    private String formatGpValue(long value) {
+        return formatNumber(value) + " gp";
+    }
+
+    private String formatNumber(long value) {
         NumberFormat formatter = NumberFormat.getIntegerInstance(Locale.US);
-        return formatter.format(rounded) + " gp/hr";
+        return formatter.format(value);
     }
 
     private String formatLimit(Integer remaining, Integer total) {
@@ -1295,10 +1378,9 @@ public class FlipHubPanel extends PluginPanel {
     }
 
     private String buildRefreshText(long asOfMs, Long priceCacheMs) {
-        DateTimeFormatter fmt = DateTimeFormatter.ofPattern("HH:mm:ss").withZone(ZoneId.systemDefault());
-        String asOf = fmt.format(Instant.ofEpochMilli(asOfMs));
+        String asOf = REFRESH_TIME_FORMATTER.format(Instant.ofEpochMilli(asOfMs));
         if (priceCacheMs != null) {
-            String cache = fmt.format(Instant.ofEpochMilli(priceCacheMs));
+            String cache = REFRESH_TIME_FORMATTER.format(Instant.ofEpochMilli(priceCacheMs));
             return "Updated: " + asOf + " (Prices: " + cache + ")";
         }
         return "Updated: " + asOf;
@@ -1889,12 +1971,8 @@ public class FlipHubPanel extends PluginPanel {
         });
     }
 
-    private String normalizeBaseUrl() {
-        return DEFAULT_BASE_URL;
-    }
-
     private void openItemPage(int itemId) {
-        String itemUrl = normalizeBaseUrl() + "/item/" + itemId;
+        String itemUrl = DEFAULT_BASE_URL + "/item/" + itemId;
         openExternalUrl(itemUrl);
     }
 

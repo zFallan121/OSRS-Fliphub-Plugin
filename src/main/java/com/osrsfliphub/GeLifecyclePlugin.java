@@ -23,10 +23,22 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.DirectoryStream;
+import java.nio.file.FileSystems;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.StandardWatchEventKinds;
+import java.nio.file.WatchEvent;
+import java.nio.file.WatchKey;
+import java.nio.file.WatchService;
 import java.awt.image.BufferedImage;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import javax.inject.Inject;
 import net.runelite.api.Client;
 import net.runelite.api.FontID;
@@ -65,6 +77,9 @@ import net.runelite.http.api.item.ItemPrice;
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
 import okhttp3.Response;
+import okhttp3.Call;
+import okhttp3.Callback;
+import okhttp3.ResponseBody;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -84,12 +99,21 @@ public class GeLifecyclePlugin extends Plugin {
     private static final String WIKI_LATEST_URL = "https://prices.runescape.wiki/api/v1/osrs/latest";
     private static final String WIKI_USER_AGENT = "FlipHub OSRS Plugin (contact: support@fliphub.app)";
     private static final long WIKI_CACHE_TTL_MS = 2 * 60 * 1000;
+    private static final long WIKI_MIN_REFRESH_MS = 60_000L;
     private static final long LOGIN_GRACE_MS = 60_000L;
     private static final long SUGGESTION_UPDATE_INTERVAL_MS = 250L;
     private static final String PRICE_SUGGESTION_WIDGET_NAME = "FlipHub Current Price";
     private static final String LIMIT_SUGGESTION_WIDGET_NAME = "FlipHub Remaining Limit";
     private static final long OFFER_POLL_INTERVAL_MS = 250L;
     private static final long LOCAL_TRADES_LOAD_RETRY_MS = 1000L;
+    private static final long PROFILE_WATCH_DEBOUNCE_MS = 1000L;
+    private static final long ACCOUNTWIDE_KEY = 0L;
+    private static final String ACCOUNTWIDE_KEY_STRING = "accountwide";
+    private static final String PROFILE_SELECTION_MODE_KEY = "profileSelectionMode";
+    private static final String PROFILE_SELECTED_KEY = "selectedProfileKey";
+    private static final String PROFILE_DIR_NAME = "fliphub";
+    private static final String LEGACY_PROFILE_DIR_NAME = "fliphub";
+    private static final String LEGACY_CONFIG_GROUP = "fliphub";
     private static final String[] OFFER_STATUS_MARKERS = new String[] {
         "offer status",
         "you have bought",
@@ -153,6 +177,11 @@ public class GeLifecyclePlugin extends Plugin {
     private NavigationButton navButton;
     private final AtomicBoolean refreshInFlight = new AtomicBoolean(false);
     private final AtomicBoolean refreshQueued = new AtomicBoolean(false);
+    private final Set<Long> loadedProfiles = ConcurrentHashMap.newKeySet();
+    private final Map<Long, Long> loadedProfileFileMs = new ConcurrentHashMap<>();
+    private final Map<Long, String> profileDisplayNames = new ConcurrentHashMap<>();
+    private final AtomicBoolean accountwideDirty = new AtomicBoolean(true);
+    private final Map<Long, LocalStatsCache> statsCacheByAccount = new ConcurrentHashMap<>();
     private volatile String currentQuery = "";
     private volatile int currentPage = 1;
     private volatile boolean bookmarkFilterEnabled = false;
@@ -169,6 +198,8 @@ public class GeLifecyclePlugin extends Plugin {
     private long localTradesLastLoadAttemptMs = 0L;
     private long lastMergedAccountHash = -1L;
     private long lastMergedNameKey = -1L;
+    private volatile String selectedProfileKey = ACCOUNTWIDE_KEY_STRING;
+    private volatile boolean manualProfileSelection = false;
     private static final int MAX_LOCAL_TRADES = 5000;
     private static final long LOCAL_EVENT_BUCKET_MS = 600L;
     private static final String[] OFFER_SETUP_BLOCKERS = new String[] {
@@ -198,6 +229,17 @@ public class GeLifecyclePlugin extends Plugin {
     private final Map<Integer, WikiPriceEntry> wikiLatestCache = new HashMap<>();
     private volatile long wikiLatestFetchedMs;
     private final AtomicBoolean wikiFetchInFlight = new AtomicBoolean(false);
+    private final AtomicLong wikiLastAttemptMs = new AtomicLong(0L);
+    private ScheduledFuture<?> wikiFetchTask;
+    private WatchService profileWatchService;
+    private Thread profileWatchThread;
+    private final AtomicBoolean profileWatchRunning = new AtomicBoolean(false);
+    private final Map<Long, ScheduledFuture<?>> pendingProfileReloads = new ConcurrentHashMap<>();
+    private final Map<WatchKey, Path> profileWatchRoots = new ConcurrentHashMap<>();
+    private final AtomicBoolean legacyProfilesMigrated = new AtomicBoolean(false);
+    private final Object legacyLocalTradesLock = new Object();
+    private volatile Map<String, String> legacyLocalTradesCache;
+    private final Map<Long, String> legacyNameKeysByHash = new ConcurrentHashMap<>();
     private GeOfferTimerOverlay offerTimerOverlay;
 
     @Provides
@@ -211,6 +253,8 @@ public class GeLifecyclePlugin extends Plugin {
         loadBookmarks();
         loadHiddenItems();
         loadOfferUpdateTimes();
+        loadProfileSelectionState();
+        ensureProfileLoaded(ACCOUNTWIDE_KEY);
         if (client != null && client.getGameState() == GameState.LOGGED_IN) {
             lastLoginMs = System.currentTimeMillis();
         }
@@ -246,6 +290,21 @@ public class GeLifecyclePlugin extends Plugin {
                 currentStatsSort = sort != null ? sort : StatsItemSort.COMPLETION;
                 refreshStatsData();
             }
+
+            @Override
+            public void onProfileSelected(String profileKey) {
+                if (profileKey == null || profileKey.trim().isEmpty()) {
+                    return;
+                }
+                manualProfileSelection = true;
+                selectedProfileKey = profileKey.trim();
+                persistProfileSelectionState();
+                ensureSelectedProfileLoaded();
+                updateProfileOptionsUI();
+                updateProfileHeader();
+                triggerPanelRefresh();
+                triggerStatsRefresh();
+            }
         }, new FlipHubPanel.BookmarkStore() {
             @Override
             public boolean isBookmarked(int itemId) {
@@ -277,6 +336,8 @@ public class GeLifecyclePlugin extends Plugin {
                 }
             }
         }, config);
+        updateProfileOptionsUI();
+        updateProfileHeader();
         BufferedImage icon = panel.buildNavIcon();
         navButton = NavigationButton.builder()
             .tooltip("FlipHub OSRS")
@@ -297,6 +358,8 @@ public class GeLifecyclePlugin extends Plugin {
         scheduler.scheduleAtFixedRate(this::pollOfferSetupItem, 1, OFFER_POLL_INTERVAL_MS, TimeUnit.MILLISECONDS);
         scheduler.execute(this::refreshPanelData);
         scheduler.execute(this::refreshStatsData);
+        startWikiFetcher();
+        startProfileWatcher();
 
         String linkInput = getLinkInput();
         if (linkInput != null && !linkInput.trim().isEmpty()) {
@@ -316,6 +379,8 @@ public class GeLifecyclePlugin extends Plugin {
         if (clientThread != null) {
             clientThread.invokeLater(this::clearPriceSuggestion);
         }
+        stopWikiFetcher();
+        stopProfileWatcher();
         if (scheduler != null) {
             scheduler.shutdownNow();
         }
@@ -347,7 +412,7 @@ public class GeLifecyclePlugin extends Plugin {
             configManager.setConfiguration("fliphub", "linkCode", "");
             configManager.setConfiguration("fliphub", "unlinkNow", false);
             if (panel != null) {
-                panel.setStatusMessage("Status: Not linked");
+                updateProfileHeader();
             }
             triggerStatsRefresh();
         }
@@ -367,28 +432,34 @@ public class GeLifecyclePlugin extends Plugin {
 
     @Subscribe
     public void onGameStateChanged(GameStateChanged event) {
-        if (event.getGameState() == GameState.LOGGED_IN) {
-            lastLoginMs = System.currentTimeMillis();
-            updateLocalAccountSessionStart();
-            primeOfferSnapshots();
-            if (config.sessionToken() == null || config.sessionToken().isEmpty()) {
-                localTradesLoadedThisLogin = false;
-                localTradesPendingNameKey = false;
-                localTradesLastLoadAttemptMs = 0L;
-                scheduleLocalTradesLoad();
-                refreshWikiLatestPrices();
-                requestGeLimits(collectKnownItemIds());
+        if (event.getGameState() != GameState.LOGGED_IN) {
+            if (panel != null) {
+                updateProfileOptionsUI();
+                updateProfileHeader();
             }
-            String linkInput = getLinkInput();
-            if (linkInput != null && !linkInput.trim().isEmpty()) {
-                attemptLink(linkInput.trim());
-            }
-            boolean visible = isPanelVisible();
-            panelVisible = visible;
-            if (visible) {
-                triggerPanelRefresh();
-                triggerStatsRefresh();
-            }
+            return;
+        }
+        lastLoginMs = System.currentTimeMillis();
+        updateLocalAccountSessionStart();
+        updateProfileForLogin();
+        primeOfferSnapshots();
+        if (config.sessionToken() == null || config.sessionToken().isEmpty()) {
+            localTradesLoadedThisLogin = false;
+            localTradesPendingNameKey = false;
+            localTradesLastLoadAttemptMs = 0L;
+            scheduleLocalTradesLoad();
+            refreshWikiLatestPrices();
+            requestGeLimits(collectKnownItemIds());
+        }
+        String linkInput = getLinkInput();
+        if (linkInput != null && !linkInput.trim().isEmpty()) {
+            attemptLink(linkInput.trim());
+        }
+        boolean visible = isPanelVisible();
+        panelVisible = visible;
+        if (visible) {
+            triggerPanelRefresh();
+            triggerStatsRefresh();
         }
     }
 
@@ -406,7 +477,7 @@ public class GeLifecyclePlugin extends Plugin {
         snapshots.put(slot, next);
         trackOfferUpdate(slot, prev, next);
         if (config.sessionToken() == null || config.sessionToken().isEmpty()) {
-            long accountKey = resolveLocalAccountKey();
+            long accountKey = resolveAccountHash();
             if (accountKey > 0) {
                 ensureLocalTradesLoaded(accountKey);
             }
@@ -436,11 +507,47 @@ public class GeLifecyclePlugin extends Plugin {
         }
 
         String eventType = determineEventType(prev, next);
+        boolean forcedCompletionFromEmpty = false;
+        OfferSnapshot eventSnapshot = next;
         if (eventType == null) {
-            return;
+            if (prev != null
+                && GrandExchangeOfferState.EMPTY.name().equals(next.state)
+                && (GrandExchangeOfferState.BOUGHT.name().equals(prev.state)
+                    || GrandExchangeOfferState.SOLD.name().equals(prev.state))) {
+                eventType = "OFFER_COMPLETED";
+                forcedCompletionFromEmpty = true;
+                eventSnapshot = prev;
+            } else {
+                return;
+            }
         }
         if (usedBaseline && "OFFER_PLACED".equals(eventType)) {
             eventType = "OFFER_UPDATED";
+        }
+
+        // Some completion events report no delta; infer remaining qty from total.
+        if ("OFFER_COMPLETED".equals(eventType) && deltaQty == 0) {
+            int prevFilled = forcedCompletionFromEmpty ? 0 : (prev != null ? prev.filledQty : 0);
+            int remaining = 0;
+            if (eventSnapshot.totalQty > 0) {
+                remaining = Math.max(0, eventSnapshot.totalQty - prevFilled);
+            }
+            if (remaining == 0 && eventSnapshot.filledQty > 0) {
+                remaining = eventSnapshot.filledQty;
+            }
+            if (remaining > 0) {
+                deltaQty = remaining;
+                if (deltaGp == 0) {
+                    long total = eventSnapshot.spentGp > 0 ? eventSnapshot.spentGp
+                        : (long) eventSnapshot.price * (long) deltaQty;
+                    if (!eventSnapshot.isBuy) {
+                        long tax = total / 50; // 2% GE tax fallback
+                        deltaGp = Math.max(0L, total - tax);
+                    } else {
+                        deltaGp = Math.max(0L, total);
+                    }
+                }
+            }
         }
 
         boolean baselineDelta = prevIsBaseline
@@ -465,7 +572,7 @@ public class GeLifecyclePlugin extends Plugin {
             }
         }
         if (baselineDelta && localTradesLoadedThisLogin && next.isBuy && !baselineSynthetic) {
-            long accountKey = resolveLocalAccountKey();
+            long accountKey = resolveAccountHash();
             if (accountKey > 0 && hasRecentLocalBuy(accountKey, next.itemId, System.currentTimeMillis())) {
                 baselineSynthetic = true;
             }
@@ -475,7 +582,7 @@ public class GeLifecyclePlugin extends Plugin {
             baselineSynthetic = true;
         }
 
-        GeEvent geEvent = GeEvent.createBase(next, prev, eventType);
+        GeEvent geEvent = GeEvent.createBase(eventSnapshot, prev, eventType);
         geEvent.world = client.getWorld();
 
         geEvent.delta_qty = deltaQty;
@@ -487,10 +594,7 @@ public class GeLifecyclePlugin extends Plugin {
         eventQueue.offer(geEvent);
         recordLocalTradeDelta(geEvent, baselineSynthetic);
 
-        if (deltaQty > 0 || "OFFER_COMPLETED".equals(eventType)) {
-            scheduleRefreshSoon();
-        } else if (config.sessionToken() == null || config.sessionToken().isEmpty()) {
-            // In local-only mode, refresh the list when offers change even without fills.
+        if (geEvent.delta_qty > 0 || "OFFER_COMPLETED".equals(eventType)) {
             scheduleRefreshSoon();
         }
     }
@@ -506,11 +610,7 @@ public class GeLifecyclePlugin extends Plugin {
         } else if (!visible && panelVisible) {
             panelVisible = false;
         }
-        if (!localTradesLoadedThisLogin && localTradesPendingNameKey) {
-            if (config.sessionToken() == null || config.sessionToken().isEmpty()) {
-                scheduleLocalTradesLoad();
-            }
-        }
+        // local profile loads are handled on login/selection
     }
 
     @Subscribe
@@ -624,6 +724,9 @@ public class GeLifecyclePlugin extends Plugin {
         }
         Integer remaining = offerPreviewItem.ge_limit_remaining;
         if (remaining == null || remaining <= 0) {
+            remaining = computeRemainingLimitSuggestion(offerPreviewItemId);
+        }
+        if (remaining == null || remaining <= 0) {
             clearLimitSuggestion();
             return;
         }
@@ -636,6 +739,49 @@ public class GeLifecyclePlugin extends Plugin {
         }
         suggestion.setHidden(false);
         suggestion.revalidate();
+    }
+
+    private Integer computeRemainingLimitSuggestion(int itemId) {
+        if (itemId <= 0) {
+            return null;
+        }
+        long accountKey = resolveLocalAccountKey();
+        if (accountKey <= 0) {
+            accountKey = resolveSelectedProfileKey();
+        }
+        if (accountKey < 0) {
+            return null;
+        }
+        ensureProfileLoaded(accountKey);
+        requestGeLimits(Collections.singleton(itemId));
+        Integer geLimit = getCachedGeLimit(itemId);
+        if ((geLimit == null || geLimit <= 0) && itemManager != null) {
+            try {
+                net.runelite.client.game.ItemStats stats = itemManager.getItemStats(itemId);
+                if (stats != null && stats.getGeLimit() > 0) {
+                    geLimit = stats.getGeLimit();
+                }
+            } catch (Exception ignored) {
+            }
+        }
+        if (geLimit == null || geLimit <= 0) {
+            return null;
+        }
+        Map<Integer, LocalLimitInfo> limitInfo = buildLocalLimitInfo(accountKey, System.currentTimeMillis());
+        LocalLimitInfo info = limitInfo.get(itemId);
+        int remaining = geLimit;
+        if (info != null && info.buyQty > 0) {
+            remaining = (int) Math.max(0L, geLimit - info.buyQty);
+        }
+        if (offerPreviewItem != null && offerPreviewItem.item_id == itemId) {
+            offerPreviewItem.ge_limit_total = geLimit;
+            offerPreviewItem.ge_limit_remaining = remaining;
+            if (info != null && info.firstBuyTs != null) {
+                long resetAt = info.firstBuyTs + (4 * 60 * 60 * 1000L);
+                offerPreviewItem.ge_limit_reset_ms = Math.max(0L, resetAt - System.currentTimeMillis());
+            }
+        }
+        return remaining;
     }
 
     private void updateChatboxSuggestions() {
@@ -1941,7 +2087,7 @@ public class GeLifecyclePlugin extends Plugin {
     private void attemptLink(String licenseKey) {
         if (!isClientLoggedIn()) {
             if (panel != null) {
-                panel.setStatusMessage("Status: Not linked");
+                updateProfileHeader();
             }
             return;
         }
@@ -1962,22 +2108,22 @@ public class GeLifecyclePlugin extends Plugin {
                     configManager.setConfiguration("fliphub", "linkCode", "");
                     refreshPanelData();
                     if (panel != null) {
-                        panel.setStatusMessage("Status: Linked");
+                        updateProfileHeader();
                     }
                 } else if (panel != null) {
-                    panel.setStatusMessage("Status: Not linked");
+                    updateProfileHeader();
                 }
             } catch (Exception ex) {
                 if (isTimeoutException(ex)) {
                     log.debug("FlipHub link timed out");
                     if (panel != null) {
-                        panel.setStatusMessage("Status: Not linked");
+                        updateProfileHeader();
                     }
                     scheduleLinkRetry(licenseKey);
                     return;
                 }
                 if (panel != null) {
-                    panel.setStatusMessage("Status: Not linked");
+                    updateProfileHeader();
                 }
                 log.warn("FlipHub link failed", ex);
             }
@@ -2006,7 +2152,7 @@ public class GeLifecyclePlugin extends Plugin {
         if (sessionToken == null || sessionToken.isEmpty() ||
             signingSecret == null || signingSecret.isEmpty()) {
                 if (panel != null) {
-                    panel.setStatusMessage("Status: Not linked");
+                    updateProfileHeader();
                 }
                 return;
             }
@@ -2030,14 +2176,14 @@ public class GeLifecyclePlugin extends Plugin {
                 boolean refreshed = attemptRefresh(sessionToken);
                 requeue(batch);
                 if (!refreshed && panel != null && isPanelVisible()) {
-                    panel.setStatusMessage("Status: Not linked");
+                    updateProfileHeader();
                 }
             } else if (status >= 500 || status == 429) {
                 requeue(batch);
             } else if (status >= 400) {
                 // Drop bad batches to avoid infinite retry loops
             } else if (panel != null) {
-                panel.setStatusMessage("Status: Linked");
+                updateProfileHeader();
             }
         } catch (Exception ex) {
             requeue(batch);
@@ -2525,7 +2671,7 @@ public class GeLifecyclePlugin extends Plugin {
                     if (apiEx.statusCode == 401) {
                         boolean refreshed = attemptRefresh(config.sessionToken());
                         if (!refreshed && panel != null && isPanelVisible()) {
-                            panel.setStatusMessage("Status: Not linked");
+                            updateProfileHeader();
                         }
                         return;
                     }
@@ -2544,6 +2690,7 @@ public class GeLifecyclePlugin extends Plugin {
         if (itemId <= 0) {
             return null;
         }
+        ensureSelectedProfileLoaded();
         requestGeLimits(Collections.singleton(itemId));
         FlipHubItem item = new FlipHubItem();
         item.item_id = itemId;
@@ -2555,9 +2702,9 @@ public class GeLifecyclePlugin extends Plugin {
             }
         }
         applyGuidePrices(item, itemId, false);
-        long accountKey = resolveLocalAccountKey();
+        long accountKey = resolveSelectedProfileKey();
         LocalLimitInfo limitInfoForItem = null;
-        if (accountKey > 0) {
+        if (accountKey >= 0) {
             Map<Integer, LocalTradeInfo> tradeInfo = buildLocalTradeInfo(accountKey);
             applyLocalTradeInfo(item, tradeInfo.get(itemId));
             Map<Integer, LocalLimitInfo> limitInfo = buildLocalLimitInfo(accountKey, System.currentTimeMillis());
@@ -2601,8 +2748,8 @@ public class GeLifecyclePlugin extends Plugin {
         if (!needsBuy && !needsSell) {
             return;
         }
-        long accountKey = resolveLocalAccountKey();
-        if (accountKey <= 0) {
+        long accountKey = resolveSelectedProfileKey();
+        if (accountKey < 0) {
             return;
         }
         Map<Integer, LocalTradeInfo> tradeInfo = buildLocalTradeInfo(accountKey);
@@ -2630,6 +2777,7 @@ public class GeLifecyclePlugin extends Plugin {
     }
 
     private void updateLocalItemsPanel() {
+        ensureSelectedProfileLoaded();
         ApiClient.ItemsResponse local = buildLocalItemsResponse(true);
         if (panel != null) {
             panel.setItems(
@@ -2705,11 +2853,12 @@ public class GeLifecyclePlugin extends Plugin {
         if (panel == null) {
             return;
         }
+        ensureSelectedProfileLoaded();
         long nowMs = System.currentTimeMillis();
         StatsRange range = currentStatsRange != null ? currentStatsRange : StatsRange.SESSION;
-        long accountKey = resolveLocalAccountKey();
+        long accountKey = resolveSelectedProfileKey();
         long sessionStartMs = nowMs;
-        if (accountKey > 0) {
+        if (accountKey >= 0) {
             synchronized (localStatsLock) {
                 Long storedStart = localSessionStartByAccount.get(accountKey);
                 if (storedStart != null && storedStart > 0) {
@@ -2721,8 +2870,8 @@ public class GeLifecyclePlugin extends Plugin {
         }
         Long sinceMs = range.getSinceMs(sessionStartMs, nowMs);
         StatsItemSort sort = currentStatsSort != null ? currentStatsSort : StatsItemSort.COMPLETION;
-        LocalStatsSnapshot localStats = accountKey > 0
-            ? buildLocalStatsSnapshot(accountKey, sinceMs, nowMs, sort)
+        LocalStatsSnapshot localStats = accountKey >= 0
+            ? buildLocalStatsSnapshot(accountKey, sinceMs, sort)
             : new LocalStatsSnapshot(new StatsSummary(), new ArrayList<>());
         panel.setStatsSummary(localStats.summary, nowMs);
         panel.setStatsItems(localStats.items, nowMs);
@@ -2751,10 +2900,23 @@ public class GeLifecyclePlugin extends Plugin {
         }
 
         try {
+            long selectedKey = resolveSelectedProfileKey();
             String sessionToken = config.sessionToken();
-            if (sessionToken == null || sessionToken.isEmpty()) {
+            if (selectedKey == ACCOUNTWIDE_KEY) {
                 if (panel != null) {
-                    panel.setStatusMessage("Status: Not linked");
+                    updateProfileHeader();
+                    if (clientThread != null) {
+                        clientThread.invokeLater(this::updateLocalItemsPanel);
+                    } else {
+                        updateLocalItemsPanel();
+                    }
+                }
+                refreshInFlight.set(false);
+                return;
+            }
+            if (sessionToken == null || sessionToken.isEmpty() || selectedKey != ACCOUNTWIDE_KEY) {
+                if (panel != null) {
+                    updateProfileHeader();
                     if (clientThread != null) {
                         clientThread.invokeLater(this::updateLocalItemsPanel);
                     } else {
@@ -2767,7 +2929,7 @@ public class GeLifecyclePlugin extends Plugin {
             String signingSecret = config.signingSecret();
             if (signingSecret == null || signingSecret.isEmpty()) {
                 if (panel != null) {
-                    panel.setStatusMessage("Status: Not linked");
+                    updateProfileHeader();
                     if (clientThread != null) {
                         clientThread.invokeLater(this::updateLocalItemsPanel);
                     } else {
@@ -2788,7 +2950,7 @@ public class GeLifecyclePlugin extends Plugin {
                     response.price_cache_ms
                 );
                 if (isPanelVisible()) {
-                    panel.setStatusMessage("Status: Linked");
+                    updateProfileHeader();
                 }
             }
         } catch (Exception ex) {
@@ -2814,7 +2976,7 @@ public class GeLifecyclePlugin extends Plugin {
                                     retry.price_cache_ms
                                 );
                                 if (isPanelVisible()) {
-                                    panel.setStatusMessage("Status: Linked");
+                                    updateProfileHeader();
                                 }
                                 refreshInFlight.set(false);
                                 return;
@@ -2825,7 +2987,7 @@ public class GeLifecyclePlugin extends Plugin {
                     }
                     if (panel != null && !refreshed) {
                         clearSession();
-                        panel.setStatusMessage("Status: Not linked");
+                        updateProfileHeader();
                         if (clientThread != null) {
                             clientThread.invokeLater(this::updateLocalItemsPanel);
                         } else {
@@ -2880,9 +3042,9 @@ public class GeLifecyclePlugin extends Plugin {
             return emptyItemsResponse(System.currentTimeMillis(), null);
         }
 
-        long accountKey = resolveLocalAccountKey();
-        Map<Integer, LocalTradeInfo> tradeInfo = accountKey > 0 ? buildLocalTradeInfo(accountKey) : new HashMap<>();
-        Map<Integer, LocalLimitInfo> limitInfo = accountKey > 0
+        long accountKey = resolveSelectedProfileKey();
+        Map<Integer, LocalTradeInfo> tradeInfo = accountKey >= 0 ? buildLocalTradeInfo(accountKey) : new HashMap<>();
+        Map<Integer, LocalLimitInfo> limitInfo = accountKey >= 0
             ? buildLocalLimitInfo(accountKey, System.currentTimeMillis())
             : new HashMap<>();
 
@@ -3153,7 +3315,7 @@ public class GeLifecyclePlugin extends Plugin {
         StatsRange range = currentStatsRange != null ? currentStatsRange : StatsRange.SESSION;
         long nowMs = System.currentTimeMillis();
         long sessionStartMs = nowMs;
-        long accountKey = resolveLocalAccountKey();
+        long accountKey = resolveAccountHash();
         if (accountKey > 0) {
             synchronized (localStatsLock) {
                 Long storedStart = localSessionStartByAccount.get(accountKey);
@@ -3190,44 +3352,7 @@ public class GeLifecyclePlugin extends Plugin {
         }
 
         try {
-            String sessionToken = config.sessionToken();
-            if (sessionToken == null || sessionToken.isEmpty()) {
-                renderLocalStats();
-                return;
-            }
-
-            Long sinceMs = getStatsSinceMs();
-            ApiClient.StatsSummaryResponse summary = apiClient.fetchStatsSummary(sessionToken, sinceMs, null);
-            if (summary != null && panel != null) {
-                panel.setStatsSummary(summary.summary, summary.as_of_ms);
-            }
-
-            StatsItemSort sort = currentStatsSort != null ? currentStatsSort : StatsItemSort.COMPLETION;
-            ApiClient.StatsItemsResponse items = apiClient.fetchStatsItems(sessionToken, sinceMs, null, 50, sort);
-            if (items != null && panel != null) {
-                panel.setStatsItems(items.items, items.as_of_ms);
-            }
-        } catch (Exception ex) {
-            if (isTimeoutException(ex)) {
-                log.debug("FlipHub fetch stats timed out");
-                return;
-            }
-            if (ex instanceof ApiClient.ApiException) {
-                ApiClient.ApiException apiEx = (ApiClient.ApiException) ex;
-                if (apiEx.statusCode == 401) {
-                    log.debug("FlipHub fetch stats failed: unauthorized");
-                    boolean refreshed = attemptRefresh(config.sessionToken());
-                    if (!refreshed && panel != null && isPanelVisible()) {
-                        clearSession();
-                        panel.setStatusMessage("Status: Not linked");
-                        renderLocalStats();
-                    }
-                } else {
-                    log.warn("FlipHub fetch stats failed", ex);
-                }
-            } else {
-                log.warn("FlipHub fetch stats failed", ex);
-            }
+            renderLocalStats();
         } finally {
             statsRefreshInFlight.set(false);
         }
@@ -3386,8 +3511,10 @@ public class GeLifecyclePlugin extends Plugin {
         if (accountKey <= 0) {
             return;
         }
-        ensureLocalTradesLoaded(accountKey);
+        ensureProfileLoaded(accountKey);
+        ensureProfileLoaded(ACCOUNTWIDE_KEY);
         ensureLocalSessionStart(accountKey, event.ts_client_ms);
+        ensureLocalSessionStart(ACCOUNTWIDE_KEY, event.ts_client_ms);
         LocalTradeDelta delta = new LocalTradeDelta(
             event.ts_client_ms,
             event.item_id,
@@ -3400,29 +3527,22 @@ public class GeLifecyclePlugin extends Plugin {
         );
         cacheItemName(event.item_id);
         synchronized (localStatsLock) {
-            List<LocalTradeDelta> deltas = localTradeDeltasByAccount.computeIfAbsent(accountKey, key -> new ArrayList<>());
-            deltas.add(delta);
-            if (deltas.size() > MAX_LOCAL_TRADES) {
-                int trim = deltas.size() - MAX_LOCAL_TRADES;
-                deltas.subList(0, trim).clear();
-            }
+            appendTradeDelta(accountKey, delta);
+            appendTradeDelta(ACCOUNTWIDE_KEY, delta);
         }
+        applyDeltaToStatsCache(accountKey, delta);
         persistLocalTrades(accountKey);
+        persistLocalTrades(ACCOUNTWIDE_KEY);
         triggerStatsRefresh();
+        triggerPanelRefresh();
     }
 
     private void ensureLocalTradesLoaded(long accountKey) {
-        if (localTradesLoadedThisLogin || localTradesPendingNameKey) {
+        if (accountKey <= 0) {
             return;
         }
-        String accountKeyString = resolveLocalAccountKeyString();
-        if (accountKeyString == null || accountKeyString.trim().isEmpty()) {
-            accountKeyString = "hash_" + accountKey;
-        }
-        boolean loaded = loadLocalTradesForAccount(accountKeyString, accountKey);
-        if (loaded) {
-            localTradesLoadedThisLogin = true;
-        }
+        ensureProfileLoaded(accountKey);
+        localTradesLoadedThisLogin = true;
     }
 
     private void scheduleLocalTradesLoad() {
@@ -3439,74 +3559,98 @@ public class GeLifecyclePlugin extends Plugin {
     }
 
     private void attemptLocalTradesLoad() {
-        String accountKey = resolveLocalAccountKeyString();
-        long accountHash = resolveLocalAccountKey();
+        long accountHash = resolveAccountHash();
         if (accountHash <= 0) {
-            localTradesPendingNameKey = true;
             return;
         }
-        if (accountKey == null || accountKey.trim().isEmpty()) {
-            accountKey = "hash_" + accountHash;
-        }
-        boolean loaded = loadLocalTradesForAccount(accountKey, accountHash);
-        if (loaded) {
-            localTradesLoadedThisLogin = true;
-        }
+        ensureProfileLoaded(accountHash);
+        localTradesLoadedThisLogin = true;
     }
 
-    private boolean loadLocalTradesForAccount(String accountKey, long accountHash) {
-        if ((accountKey == null || accountKey.trim().isEmpty()) || accountHash <= 0 || configManager == null || gson == null) {
+    private boolean loadLocalTradesForAccount(long accountHash) {
+        return loadLocalTradesForAccount(accountHash, true);
+    }
+
+    private boolean loadLocalTradesForAccount(long accountHash, boolean persistAfterLoad) {
+        if (accountHash < 0 || gson == null) {
             return false;
         }
-        String primaryKey = accountKey.trim();
-        List<String> keys = buildLocalTradesKeys(primaryKey, accountHash);
-        List<LocalTradeDelta> merged = mergeLocalTrades(
-            readLocalTrades(keys, 0),
-            readLocalTrades(keys, 1),
-            readLocalTrades(keys, 2),
-            readLocalTrades(keys, 3)
-        );
-        List<LocalTradeDelta> existing;
-        synchronized (localStatsLock) {
-            List<LocalTradeDelta> deltas = localTradeDeltasByAccount.get(accountHash);
-            existing = deltas != null ? new ArrayList<>(deltas) : null;
+        Path file = getProfileFile(accountHash);
+        if (file != null) {
+            long fileMs = getProfileFileModifiedMs(file);
+            if (fileMs > 0) {
+                loadedProfileFileMs.put(accountHash, fileMs);
+            }
         }
-        if (existing != null && !existing.isEmpty()) {
-            merged = mergeLocalTrades(merged, existing, null, null);
+        ProfileData profile = readProfileData(accountHash);
+        List<LocalTradeDelta> merged = profile != null ? profile.deltas : null;
+        String profileName = profile != null ? profile.displayName : null;
+        boolean placeholderName = isPlaceholderDisplayName(profileName);
+        if (accountHash == ACCOUNTWIDE_KEY) {
+            merged = buildAccountwideFromDisk();
         }
-        if (merged == null || merged.isEmpty()) {
-            boolean hasNameKey = resolveLocalAccountNameKey() != null;
-            localTradesPendingNameKey = !hasNameKey;
-            return hasNameKey;
+        if (accountHash != ACCOUNTWIDE_KEY) {
+            if (merged == null || merged.isEmpty()) {
+                merged = readLegacyLocalTrades(accountHash);
+            } else if (placeholderName) {
+                List<LocalTradeDelta> legacy = readLegacyLocalTrades(accountHash);
+                if (legacy != null && !legacy.isEmpty()) {
+                    merged = legacy;
+                }
+            }
+        }
+        if (merged == null) {
+            merged = new ArrayList<>();
         }
         synchronized (localStatsLock) {
             localTradeDeltasByAccount.put(accountHash, new ArrayList<>(merged));
+        }
+        rebuildStatsCache(accountHash, merged);
+        String resolvedName = null;
+        if (profileName != null && !profileName.trim().isEmpty() && !isPlaceholderDisplayName(profileName)) {
+            resolvedName = profileName.trim();
+        }
+        if (resolvedName == null) {
+            String legacyKey = legacyNameKeysByHash.get(accountHash);
+            String legacyDisplay = displayNameFromLegacyKey(legacyKey);
+            if (legacyDisplay == null) {
+                legacyDisplay = resolveLegacyDisplayNameForHash(accountHash);
+            }
+            if (legacyDisplay != null && !legacyDisplay.trim().isEmpty()) {
+                resolvedName = legacyDisplay.trim();
+            }
+        }
+        if (resolvedName != null && !resolvedName.trim().isEmpty()) {
+            profileDisplayNames.put(accountHash, resolvedName.trim());
         }
         for (LocalTradeDelta delta : merged) {
             if (delta != null && delta.itemId > 0) {
                 cacheItemName(delta.itemId);
             }
         }
-        String json = gson.toJson(merged);
-        for (String key : keys) {
-            configManager.setConfiguration("fliphub", "localTrades." + key, json);
+        if (persistAfterLoad) {
+            persistLocalTrades(accountHash);
+        } else if (accountHash != ACCOUNTWIDE_KEY) {
+            accountwideDirty.set(true);
         }
         scheduleRefreshSoon();
         triggerStatsRefresh();
-        localTradesPendingNameKey = false;
         return true;
     }
 
+    private boolean isPlaceholderDisplayName(String displayName) {
+        if (displayName == null) {
+            return true;
+        }
+        String trimmed = displayName.trim();
+        if (trimmed.isEmpty()) {
+            return true;
+        }
+        return trimmed.startsWith("Profile ");
+    }
+
     private void persistLocalTrades(long accountKey) {
-        if (accountKey <= 0 || configManager == null || gson == null) {
-            return;
-        }
-        String primaryKey = resolveLocalAccountKeyString();
-        if (primaryKey == null || primaryKey.trim().isEmpty()) {
-            primaryKey = "hash_" + accountKey;
-        }
-        List<String> keys = buildLocalTradesKeys(primaryKey, accountKey);
-        if (keys.isEmpty()) {
+        if (accountKey < 0 || gson == null) {
             return;
         }
         List<LocalTradeDelta> snapshot;
@@ -3514,22 +3658,435 @@ public class GeLifecyclePlugin extends Plugin {
             List<LocalTradeDelta> deltas = localTradeDeltasByAccount.get(accountKey);
             snapshot = deltas != null ? new ArrayList<>(deltas) : new ArrayList<>();
         }
-        List<LocalTradeDelta> merged = mergeLocalTrades(
-            snapshot,
-            readLocalTrades(keys, 0),
-            readLocalTrades(keys, 1),
-            readLocalTrades(keys, 2)
-        );
-        merged = mergeLocalTrades(merged, readLocalTrades(keys, 3), null, null);
-        if (merged == null || merged.isEmpty()) {
-            merged = snapshot;
-        }
-        String json = gson.toJson(merged);
-        for (String key : keys) {
-            configManager.setConfiguration("fliphub", "localTrades." + key, json);
-        }
+        writeProfileData(accountKey, snapshot);
         localTradesLoadedThisLogin = true;
-        localTradesPendingNameKey = false;
+        if (accountKey != ACCOUNTWIDE_KEY) {
+            accountwideDirty.set(true);
+        }
+    }
+
+    private void appendTradeDelta(long accountKey, LocalTradeDelta delta) {
+        if (accountKey < 0 || delta == null) {
+            return;
+        }
+        List<LocalTradeDelta> deltas = localTradeDeltasByAccount.computeIfAbsent(accountKey, key -> new ArrayList<>());
+        deltas.add(delta);
+        if (deltas.size() > MAX_LOCAL_TRADES) {
+            int trim = deltas.size() - MAX_LOCAL_TRADES;
+            deltas.subList(0, trim).clear();
+        }
+    }
+
+    private boolean hasLocalTrades(long accountKey) {
+        if (accountKey < 0) {
+            return false;
+        }
+        ensureProfileLoaded(accountKey);
+        synchronized (localStatsLock) {
+            List<LocalTradeDelta> deltas = localTradeDeltasByAccount.get(accountKey);
+            if (deltas != null && !deltas.isEmpty()) {
+                return true;
+            }
+        }
+        // If a profile was loaded before the on-disk file changed, reload once.
+        loadLocalTradesForAccount(accountKey);
+        synchronized (localStatsLock) {
+            List<LocalTradeDelta> deltas = localTradeDeltasByAccount.get(accountKey);
+            return deltas != null && !deltas.isEmpty();
+        }
+    }
+
+    private void ensureProfileLoaded(long accountKey) {
+        if (accountKey < 0) {
+            return;
+        }
+        if (accountKey == ACCOUNTWIDE_KEY) {
+            if (!loadedProfiles.contains(accountKey) || accountwideDirty.getAndSet(false)) {
+                loadLocalTradesForAccount(accountKey);
+                loadedProfiles.add(accountKey);
+            }
+            return;
+        }
+        if (loadedProfiles.contains(accountKey)) {
+            return;
+        }
+        loadLocalTradesForAccount(accountKey);
+        loadedProfiles.add(accountKey);
+    }
+
+    private long getProfileFileModifiedMs(Path file) {
+        if (file == null || !Files.exists(file)) {
+            return 0L;
+        }
+        try {
+            return Files.getLastModifiedTime(file).toMillis();
+        } catch (Exception ignored) {
+            return 0L;
+        }
+    }
+
+    private void ensureSelectedProfileLoaded() {
+        long key = resolveSelectedProfileKey();
+        ensureProfileLoaded(key);
+    }
+
+    private void startProfileWatcher() {
+        if (profileWatchRunning.get()) {
+            return;
+        }
+        Path profilesDir = getProfilesDir();
+        Path legacyDir = getLegacyProfilesDir();
+        if (profilesDir == null && legacyDir == null) {
+            return;
+        }
+        try {
+            profileWatchService = FileSystems.getDefault().newWatchService();
+            if (profilesDir != null && Files.exists(profilesDir)) {
+                registerProfileWatchDir(profilesDir);
+            }
+            if (legacyDir != null && Files.exists(legacyDir)) {
+                registerProfileWatchDir(legacyDir);
+            }
+        } catch (IOException ex) {
+            profileWatchService = null;
+            return;
+        }
+        profileWatchRunning.set(true);
+        profileWatchThread = new Thread(this::runProfileWatchLoop, "fliphub-profile-watch");
+        profileWatchThread.setDaemon(true);
+        profileWatchThread.start();
+    }
+
+    private void stopProfileWatcher() {
+        profileWatchRunning.set(false);
+        if (profileWatchThread != null) {
+            profileWatchThread.interrupt();
+            profileWatchThread = null;
+        }
+        if (profileWatchService != null) {
+            try {
+                profileWatchService.close();
+            } catch (IOException ignored) {
+            }
+            profileWatchService = null;
+        }
+        for (ScheduledFuture<?> future : pendingProfileReloads.values()) {
+            if (future != null) {
+                future.cancel(true);
+            }
+        }
+        pendingProfileReloads.clear();
+        profileWatchRoots.clear();
+    }
+
+    private void registerProfileWatchDir(Path dir) throws IOException {
+        WatchKey key = dir.register(
+            profileWatchService,
+            StandardWatchEventKinds.ENTRY_CREATE,
+            StandardWatchEventKinds.ENTRY_MODIFY
+        );
+        profileWatchRoots.put(key, dir);
+    }
+
+    private void runProfileWatchLoop() {
+        while (profileWatchRunning.get()) {
+            WatchKey key;
+            try {
+                key = profileWatchService.take();
+            } catch (InterruptedException ex) {
+                Thread.currentThread().interrupt();
+                return;
+            } catch (Exception ex) {
+                return;
+            }
+            Path root = profileWatchRoots.get(key);
+            if (root != null) {
+                for (WatchEvent<?> event : key.pollEvents()) {
+                    if (event == null || event.kind() == StandardWatchEventKinds.OVERFLOW) {
+                        continue;
+                    }
+                    Object context = event.context();
+                    if (!(context instanceof Path)) {
+                        continue;
+                    }
+                    Path file = root.resolve((Path) context);
+                    long accountKey = parseAccountKeyFromProfileFile(file);
+                    if (accountKey > 0) {
+                        scheduleProfileReload(accountKey, file);
+                    }
+                }
+            }
+            if (!key.reset()) {
+                profileWatchRoots.remove(key);
+            }
+        }
+    }
+
+    private long parseAccountKeyFromProfileFile(Path file) {
+        if (file == null) {
+            return -1L;
+        }
+        String name = file.getFileName().toString();
+        if (name == null || !name.endsWith(".json")) {
+            return -1L;
+        }
+        if ("accountwide.json".equalsIgnoreCase(name)) {
+            return -1L;
+        }
+        if (!name.startsWith("hash_")) {
+            return -1L;
+        }
+        String hashPart = name.substring(5, name.length() - ".json".length());
+        try {
+            return Long.parseLong(hashPart);
+        } catch (Exception ex) {
+            return -1L;
+        }
+    }
+
+    private void scheduleProfileReload(long accountKey, Path file) {
+        if (scheduler == null || accountKey <= 0) {
+            return;
+        }
+        long fileMs = getProfileFileModifiedMs(file);
+        Long loadedMs = loadedProfileFileMs.get(accountKey);
+        if (fileMs > 0 && loadedMs != null && fileMs <= loadedMs) {
+            return;
+        }
+        ScheduledFuture<?> existing = pendingProfileReloads.get(accountKey);
+        if (existing != null && !existing.isDone()) {
+            return;
+        }
+        ScheduledFuture<?> future = scheduler.schedule(() -> {
+            pendingProfileReloads.remove(accountKey);
+            reloadProfileFromDisk(accountKey);
+        }, PROFILE_WATCH_DEBOUNCE_MS, TimeUnit.MILLISECONDS);
+        pendingProfileReloads.put(accountKey, future);
+    }
+
+    private void reloadProfileFromDisk(long accountKey) {
+        if (accountKey <= 0) {
+            return;
+        }
+        loadLocalTradesForAccount(accountKey, false);
+        loadedProfiles.add(accountKey);
+        accountwideDirty.set(true);
+    }
+
+    private Path getProfilesDir() {
+        String home = System.getProperty("user.home");
+        if (home == null || home.trim().isEmpty()) {
+            return null;
+        }
+        Path dir = Paths.get(home, ".runelite", PROFILE_DIR_NAME, "profiles");
+        try {
+            Files.createDirectories(dir);
+        } catch (IOException ignored) {
+        }
+        migrateLegacyProfilesIfNeeded(home, dir);
+        return dir;
+    }
+
+    private Path getLegacyProfilesDir() {
+        String home = System.getProperty("user.home");
+        if (home == null || home.trim().isEmpty()) {
+            return null;
+        }
+        return Paths.get(home, ".runelite", LEGACY_PROFILE_DIR_NAME, "profiles");
+    }
+
+    private void migrateLegacyProfilesIfNeeded(String home, Path devDir) {
+        if (home == null || devDir == null) {
+            return;
+        }
+        if (!legacyProfilesMigrated.compareAndSet(false, true)) {
+            return;
+        }
+        Path legacyDir = Paths.get(home, ".runelite", LEGACY_PROFILE_DIR_NAME, "profiles");
+        if (!Files.exists(legacyDir)) {
+            return;
+        }
+        try (DirectoryStream<Path> stream = Files.newDirectoryStream(legacyDir, "*.json")) {
+            boolean devHasFiles = false;
+            if (Files.exists(devDir)) {
+                try (java.util.stream.Stream<Path> devStream = Files.list(devDir)) {
+                    devHasFiles = devStream.findAny().isPresent();
+                }
+            }
+            for (Path legacyFile : stream) {
+                if (legacyFile == null) {
+                    continue;
+                }
+                Path target = devDir.resolve(legacyFile.getFileName());
+                if (Files.exists(target)) {
+                    continue;
+                }
+                Files.copy(legacyFile, target);
+                devHasFiles = true;
+            }
+            if (!devHasFiles) {
+                legacyProfilesMigrated.set(false);
+            }
+        } catch (Exception ignored) {
+        }
+    }
+
+    private Path getProfileFile(long accountHash) {
+        Path dir = getProfilesDir();
+        if (dir == null) {
+            return null;
+        }
+        if (accountHash == ACCOUNTWIDE_KEY) {
+            return dir.resolve("accountwide.json");
+        }
+        return dir.resolve("hash_" + accountHash + ".json");
+    }
+
+    private ProfileData readProfileData(long accountHash) {
+        Path file = getProfileFile(accountHash);
+        return readProfileData(file);
+    }
+
+    private ProfileData readProfileData(Path file) {
+        if (file == null || !Files.exists(file)) {
+            return null;
+        }
+        try {
+            String json = Files.readString(file, StandardCharsets.UTF_8);
+            if (json == null || json.trim().isEmpty()) {
+                return null;
+            }
+            return gson.fromJson(json, ProfileData.class);
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    private void writeProfileData(long accountHash, List<LocalTradeDelta> deltas) {
+        Path file = getProfileFile(accountHash);
+        if (file == null) {
+            return;
+        }
+        ProfileData data = new ProfileData();
+        data.accountHash = accountHash;
+        data.displayName = accountHash == ACCOUNTWIDE_KEY ? "Accountwide" : profileDisplayNames.get(accountHash);
+        data.deltas = deltas != null ? deltas : new ArrayList<>();
+        data.updatedMs = System.currentTimeMillis();
+        try {
+            String json = gson.toJson(data);
+            Files.writeString(file, json, StandardCharsets.UTF_8);
+            long fileMs = getProfileFileModifiedMs(file);
+            if (fileMs > 0) {
+                loadedProfileFileMs.put(accountHash, fileMs);
+            }
+        } catch (Exception ignored) {
+        }
+    }
+
+    private List<LocalTradeDelta> readLegacyLocalTrades(long accountHash) {
+        if (configManager == null || gson == null || accountHash <= 0) {
+            return null;
+        }
+        List<LocalTradeDelta> byName = null;
+        String legacyNameKey = legacyNameKeysByHash.get(accountHash);
+        if (legacyNameKey != null) {
+            byName = readLegacyLocalTrades(legacyNameKey);
+        }
+        String primaryKey = "hash_" + accountHash;
+        List<String> keys = buildLegacyLocalTradesKeys(primaryKey, accountHash);
+        if (byName != null && !byName.isEmpty()) {
+            return mergeLocalTrades(
+                byName,
+                readLegacyLocalTrades(keys, 0),
+                readLegacyLocalTrades(keys, 1),
+                readLegacyLocalTrades(keys, 2)
+            );
+        }
+        return mergeLocalTrades(
+            readLegacyLocalTrades(keys, 0),
+            readLegacyLocalTrades(keys, 1),
+            readLegacyLocalTrades(keys, 2),
+            readLegacyLocalTrades(keys, 3)
+        );
+    }
+
+    private List<LocalTradeDelta> buildAccountwideFromDisk() {
+        List<LocalTradeDelta> merged = new ArrayList<>();
+        Set<String> seen = new HashSet<>();
+        mergeAccountwideFromDir(merged, seen, getProfilesDir());
+        mergeAccountwideFromDir(merged, seen, getLegacyProfilesDir());
+        mergeAccountwideFromLegacyConfig(merged, seen);
+        if (merged.isEmpty()) {
+            return null;
+        }
+        merged.sort(Comparator.comparingLong(delta -> delta != null ? delta.tsClientMs : 0L));
+        if (merged.size() > MAX_LOCAL_TRADES) {
+            int trim = merged.size() - MAX_LOCAL_TRADES;
+            merged.subList(0, trim).clear();
+        }
+        return merged;
+    }
+
+    private void mergeAccountwideFromLegacyConfig(List<LocalTradeDelta> merged, Set<String> seen) {
+        Map<String, String> entries = getLegacyLocalTradesCache();
+        if (entries == null || entries.isEmpty()) {
+            return;
+        }
+        Type type = new TypeToken<List<LocalTradeDelta>>() {}.getType();
+        for (String raw : entries.values()) {
+            if (raw == null || raw.trim().isEmpty()) {
+                continue;
+            }
+            try {
+                List<LocalTradeDelta> deltas = gson.fromJson(raw, type);
+                if (deltas == null || deltas.isEmpty()) {
+                    continue;
+                }
+                for (LocalTradeDelta delta : deltas) {
+                    if (delta == null) {
+                        continue;
+                    }
+                    if (seen.add(buildLocalTradeSignature(delta))) {
+                        merged.add(delta);
+                    }
+                }
+            } catch (Exception ignored) {
+            }
+        }
+    }
+
+    private void mergeAccountwideFromDir(List<LocalTradeDelta> merged, Set<String> seen, Path dir) {
+        if (dir == null || !Files.exists(dir)) {
+            return;
+        }
+        try (DirectoryStream<Path> stream = Files.newDirectoryStream(dir, "hash_*.json")) {
+            for (Path path : stream) {
+                String fileName = path.getFileName().toString();
+                if (!fileName.startsWith("hash_")) {
+                    continue;
+                }
+                String hashPart = fileName.substring(5, fileName.length() - ".json".length());
+                long hash;
+                try {
+                    hash = Long.parseLong(hashPart);
+                } catch (Exception ex) {
+                    continue;
+                }
+                ProfileData data = readProfileData(path);
+                if (data == null || data.deltas == null || data.deltas.isEmpty()) {
+                    continue;
+                }
+                for (LocalTradeDelta delta : data.deltas) {
+                    if (delta == null) {
+                        continue;
+                    }
+                    if (seen.add(buildLocalTradeSignature(delta))) {
+                        merged.add(delta);
+                    }
+                }
+            }
+        } catch (IOException ignored) {
+        }
     }
 
     private void cacheItemName(int itemId) {
@@ -3577,6 +4134,33 @@ public class GeLifecyclePlugin extends Plugin {
         }
     }
 
+    private List<LocalTradeDelta> readLegacyLocalTrades(List<String> keys, int index) {
+        if (keys == null || index < 0 || index >= keys.size()) {
+            return null;
+        }
+        return readLegacyLocalTrades(keys.get(index));
+    }
+
+    private List<LocalTradeDelta> readLegacyLocalTrades(String key) {
+        if (key == null || key.trim().isEmpty() || configManager == null || gson == null) {
+            return null;
+        }
+        Map<String, String> legacyCache = getLegacyLocalTradesCache();
+        String raw = legacyCache != null ? legacyCache.get(key.trim()) : null;
+        if (raw == null || raw.trim().isEmpty()) {
+            raw = configManager.getConfiguration(LEGACY_CONFIG_GROUP, "localTrades." + key);
+        }
+        if (raw == null || raw.trim().isEmpty()) {
+            return null;
+        }
+        try {
+            Type type = new TypeToken<List<LocalTradeDelta>>() {}.getType();
+            return gson.fromJson(raw, type);
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
     private List<String> buildLocalTradesKeys(String primaryKey, long accountHash) {
         List<String> keys = new ArrayList<>();
         addLocalTradesKey(keys, primaryKey);
@@ -3584,6 +4168,16 @@ public class GeLifecyclePlugin extends Plugin {
         addLocalTradesKey(keys, resolveAccountHashKey());
         if (accountHash > 0) {
             addLocalTradesKey(keys, "hash_" + accountHash);
+        }
+        return keys;
+    }
+
+    private List<String> buildLegacyLocalTradesKeys(String primaryKey, long accountHash) {
+        List<String> keys = new ArrayList<>();
+        addLocalTradesKey(keys, primaryKey);
+        if (accountHash > 0) {
+            addLocalTradesKey(keys, "hash_" + accountHash);
+            addLocalTradesKey(keys, String.valueOf(accountHash));
         }
         return keys;
     }
@@ -3648,20 +4242,62 @@ public class GeLifecyclePlugin extends Plugin {
         return bucket + "|" + delta.itemId + "|" + delta.isBuy + "|" + delta.deltaQty + "|" + delta.price;
     }
 
-    private LocalStatsSnapshot buildLocalStatsSnapshot(long accountKey, Long sinceMs, long nowMs, StatsItemSort sort) {
-        List<LocalTradeDelta> snapshot;
-        synchronized (localStatsLock) {
-            List<LocalTradeDelta> deltas = localTradeDeltasByAccount.get(accountKey);
-            snapshot = deltas != null ? new ArrayList<>(deltas) : new ArrayList<>();
+    private LocalStatsSnapshot buildLocalStatsSnapshot(long accountKey, Long sinceMs, StatsItemSort sort) {
+        if (sinceMs == null) {
+            if (accountKey == ACCOUNTWIDE_KEY) {
+                return buildAccountwideStatsSnapshotFromCaches(sort);
+            }
+            return buildLocalStatsSnapshotFromCache(accountKey, sort);
         }
+        if (accountKey == ACCOUNTWIDE_KEY) {
+            return buildAccountwideStatsSnapshot(sinceMs, sort);
+        }
+        return buildLocalStatsSnapshotForAccount(accountKey, sinceMs, sort);
+    }
 
-        snapshot.sort(Comparator
-            .comparingLong((LocalTradeDelta delta) -> delta != null ? delta.tsClientMs / LOCAL_EVENT_BUCKET_MS : 0L)
-            .thenComparingInt(delta -> delta != null && delta.isBuy ? 0 : 1)
-            .thenComparingLong(delta -> delta != null ? delta.tsClientMs : 0L));
-        long since = sinceMs != null ? sinceMs : Long.MIN_VALUE;
-        Map<Integer, LocalItemAgg> itemAggs = new HashMap<>();
-        Map<Integer, LocalInventoryState> inventory = new HashMap<>();
+    private LocalStatsSnapshot buildLocalStatsSnapshotFromCache(long accountKey, StatsItemSort sort) {
+        ensureProfileLoaded(accountKey);
+        LocalStatsCache cache = getOrBuildStatsCache(accountKey);
+        if (cache == null) {
+            return new LocalStatsSnapshot(new StatsSummary(), new ArrayList<>());
+        }
+        List<StatsItem> items = cache.getItems();
+        hydrateLocalItemNames(items);
+        items.sort(buildLocalStatsComparator(sort));
+        return new LocalStatsSnapshot(cache.getSummary(), items);
+    }
+
+    private LocalStatsSnapshot buildLocalStatsSnapshotForAccount(long accountKey, Long sinceMs, StatsItemSort sort) {
+        ensureProfileLoaded(accountKey);
+        LocalStatsCache cache = getOrBuildStatsCache(accountKey);
+        if (cache == null) {
+            return new LocalStatsSnapshot(new StatsSummary(), new ArrayList<>());
+        }
+        LocalStatsSnapshot snapshot = cache.buildSnapshotSince(sinceMs);
+        List<StatsItem> items = snapshot.items != null ? snapshot.items : new ArrayList<>();
+        hydrateLocalItemNames(items);
+        items.sort(buildLocalStatsComparator(sort));
+        return new LocalStatsSnapshot(snapshot.summary, items);
+    }
+
+    private void hydrateLocalItemNames(List<StatsItem> items) {
+        if (items == null || items.isEmpty()) {
+            return;
+        }
+        for (StatsItem item : items) {
+            if (item == null || item.item_id <= 0) {
+                continue;
+            }
+            String cachedName = getCachedItemName(item.item_id);
+            item.item_name = cachedName;
+            if (cachedName == null || cachedName.trim().isEmpty()) {
+                cacheItemName(item.item_id);
+            }
+        }
+    }
+
+    private LocalStatsSnapshot buildAccountwideStatsSnapshot(Long sinceMs, StatsItemSort sort) {
+        Map<Integer, StatsItem> mergedItems = new HashMap<>();
         long totalProfit = 0L;
         long totalCost = 0L;
         long totalQty = 0L;
@@ -3671,127 +4307,168 @@ public class GeLifecyclePlugin extends Plugin {
         Long firstBuyTs = null;
         Long lastSellTs = null;
 
-        for (LocalTradeDelta delta : snapshot) {
-            if (delta == null) {
+        Map<Long, String> profiles = loadProfilesFromDisk();
+        for (Long key : profiles.keySet()) {
+            if (key == null || key <= 0) {
                 continue;
             }
-            boolean isCompletion = "OFFER_COMPLETED".equals(delta.eventType);
-            if (delta.deltaQty <= 0 && !isCompletion) {
+            ensureProfileLoaded(key);
+            LocalStatsSnapshot snapshot = buildLocalStatsSnapshotForAccount(key, sinceMs, sort);
+            if (snapshot == null || snapshot.summary == null) {
                 continue;
             }
-            LocalInventoryState state = inventory.computeIfAbsent(delta.itemId, LocalInventoryState::new);
-            if (delta.isBuy) {
-                if (delta.deltaQty <= 0) {
+            StatsSummary summary = snapshot.summary;
+            totalProfit += summary.total_profit_gp != null ? summary.total_profit_gp : 0L;
+            totalCost += summary.total_cost_gp != null ? summary.total_cost_gp : 0L;
+            totalQty += summary.total_qty != null ? summary.total_qty : 0L;
+            totalTax += summary.tax_paid_gp != null ? summary.tax_paid_gp : 0L;
+            totalActiveMs += summary.active_ms != null ? summary.active_ms : 0L;
+            totalCompleted += summary.fill_count != null ? summary.fill_count : 0;
+            if (summary.first_buy_ts_ms != null && (firstBuyTs == null || summary.first_buy_ts_ms < firstBuyTs)) {
+                firstBuyTs = summary.first_buy_ts_ms;
+            }
+            if (summary.last_sell_ts_ms != null && (lastSellTs == null || summary.last_sell_ts_ms > lastSellTs)) {
+                lastSellTs = summary.last_sell_ts_ms;
+            }
+
+            if (snapshot.items == null) {
+                continue;
+            }
+            for (StatsItem item : snapshot.items) {
+                if (item == null || item.item_id <= 0) {
                     continue;
                 }
-                state.qty += delta.deltaQty;
-                state.cost += Math.max(0L, delta.deltaGp);
-                if (state.firstBuyTs == null || delta.tsClientMs < state.firstBuyTs) {
-                    state.firstBuyTs = delta.tsClientMs;
+                StatsItem merged = mergedItems.computeIfAbsent(item.item_id, keyItem -> {
+                    StatsItem next = new StatsItem();
+                    next.item_id = keyItem;
+                    next.item_name = item.item_name;
+                    next.total_profit_gp = 0L;
+                    next.total_cost_gp = 0L;
+                    next.total_qty = 0;
+                    next.fill_count = 0;
+                    next.last_sell_ts_ms = item.last_sell_ts_ms;
+                    return next;
+                });
+                long profit = item.total_profit_gp != null ? item.total_profit_gp : 0L;
+                long cost = item.total_cost_gp != null ? item.total_cost_gp : 0L;
+                int qty = item.total_qty != null ? item.total_qty : 0;
+                int fills = item.fill_count != null ? item.fill_count : 0;
+                merged.total_profit_gp = (merged.total_profit_gp != null ? merged.total_profit_gp : 0L) + profit;
+                merged.total_cost_gp = (merged.total_cost_gp != null ? merged.total_cost_gp : 0L) + cost;
+                merged.total_qty = (merged.total_qty != null ? merged.total_qty : 0) + qty;
+                merged.fill_count = (merged.fill_count != null ? merged.fill_count : 0) + fills;
+                if (merged.item_name == null || merged.item_name.trim().isEmpty()) {
+                    merged.item_name = item.item_name;
                 }
-                continue;
-            }
-
-            if (state.qty <= 0 && !isCompletion) {
-                continue;
-            }
-
-            long matchQty = 0L;
-            long matchCost = 0L;
-            long matchRevenue = 0L;
-            Long matchedBuyTs = state.firstBuyTs;
-            if (delta.deltaQty > 0 && state.qty > 0) {
-                matchQty = Math.min((long) delta.deltaQty, state.qty);
-                if (matchQty > 0) {
-                    matchRevenue = delta.deltaGp;
-                    if (matchQty < delta.deltaQty) {
-                        matchRevenue = (delta.deltaGp * matchQty) / delta.deltaQty;
-                    }
-                    if (matchQty >= state.qty) {
-                        matchCost = state.cost;
-                        state.qty = 0L;
-                        state.cost = 0L;
-                        state.firstBuyTs = null;
-                    } else {
-                        matchCost = (state.cost * matchQty) / state.qty;
-                        state.qty -= matchQty;
-                        state.cost = Math.max(0L, state.cost - matchCost);
-                    }
+                if (item.last_sell_ts_ms != null
+                    && (merged.last_sell_ts_ms == null || item.last_sell_ts_ms > merged.last_sell_ts_ms)) {
+                    merged.last_sell_ts_ms = item.last_sell_ts_ms;
                 }
-            }
-
-            if (delta.tsClientMs < since) {
-                continue;
-            }
-
-            LocalItemAgg agg = itemAggs.computeIfAbsent(delta.itemId, LocalItemAgg::new);
-            if (matchQty > 0) {
-                agg.buyCost += matchCost;
-                agg.buyQty += matchQty;
-                agg.sellRevenue += Math.max(0L, matchRevenue);
-                agg.sellQty += matchQty;
-                long tax = ((long) delta.price * matchQty) / 50L;
-                agg.taxPaid += Math.max(0L, tax);
-                if (matchedBuyTs == null) {
-                    matchedBuyTs = delta.tsClientMs;
-                }
-                if (agg.firstBuyTs == null || matchedBuyTs < agg.firstBuyTs) {
-                    agg.firstBuyTs = matchedBuyTs;
-                }
-                long duration = delta.tsClientMs - matchedBuyTs;
-                if (duration > 0) {
-                    agg.activeMs += duration;
-                }
-            }
-            if (agg.lastSellTs == null || delta.tsClientMs > agg.lastSellTs) {
-                agg.lastSellTs = delta.tsClientMs;
-            }
-            if (isCompletion && !delta.isBuy) {
-                agg.completedSells += 1;
             }
         }
 
-        List<StatsItem> items = new ArrayList<>();
-        for (LocalItemAgg agg : itemAggs.values()) {
-            if (agg.buyQty <= 0 || agg.sellQty <= 0) {
+        List<StatsItem> items = new ArrayList<>(mergedItems.values());
+        StatsSummary summary = finalizeAccountwideSnapshot(items, sort, totalProfit, totalCost, totalQty, totalTax,
+            totalActiveMs, totalCompleted, firstBuyTs, lastSellTs);
+        return new LocalStatsSnapshot(summary, items);
+    }
+
+    private LocalStatsSnapshot buildAccountwideStatsSnapshotFromCaches(StatsItemSort sort) {
+        Map<Integer, StatsItem> mergedItems = new HashMap<>();
+        long totalProfit = 0L;
+        long totalCost = 0L;
+        long totalQty = 0L;
+        long totalTax = 0L;
+        long totalActiveMs = 0L;
+        int totalCompleted = 0;
+        Long firstBuyTs = null;
+        Long lastSellTs = null;
+
+        Map<Long, String> profiles = loadProfilesFromDisk();
+        for (Long key : profiles.keySet()) {
+            if (key == null || key <= 0) {
                 continue;
             }
-            long profit = agg.sellRevenue - agg.buyCost;
-            long cost = agg.buyCost;
-            long qty = agg.sellQty;
-            double roi = cost > 0 ? (profit * 100.0) / cost : 0.0;
-
-            StatsItem item = new StatsItem();
-            item.item_id = agg.itemId;
-            String cachedName = getCachedItemName(agg.itemId);
-            item.item_name = cachedName;
-            if (cachedName == null || cachedName.trim().isEmpty()) {
-                cacheItemName(agg.itemId);
+            ensureProfileLoaded(key);
+            LocalStatsCache cache = getOrBuildStatsCache(key);
+            if (cache == null) {
+                continue;
             }
-            item.total_profit_gp = profit;
-            item.total_cost_gp = cost;
-            item.roi_percent = roi;
-            item.total_qty = (int) Math.min(Integer.MAX_VALUE, Math.max(0, qty));
-            item.fill_count = agg.completedSells;
-            item.last_sell_ts_ms = agg.lastSellTs;
-            items.add(item);
-
-            totalProfit += profit;
-            totalCost += cost;
-            totalQty += qty;
-            totalTax += agg.taxPaid;
-            totalActiveMs += agg.activeMs;
-            totalCompleted += agg.completedSells;
-            if (agg.firstBuyTs != null && (firstBuyTs == null || agg.firstBuyTs < firstBuyTs)) {
-                firstBuyTs = agg.firstBuyTs;
+            StatsSummary summary = cache.getSummary();
+            totalProfit += summary.total_profit_gp != null ? summary.total_profit_gp : 0L;
+            totalCost += summary.total_cost_gp != null ? summary.total_cost_gp : 0L;
+            totalQty += summary.total_qty != null ? summary.total_qty : 0L;
+            totalTax += summary.tax_paid_gp != null ? summary.tax_paid_gp : 0L;
+            totalActiveMs += summary.active_ms != null ? summary.active_ms : 0L;
+            totalCompleted += summary.fill_count != null ? summary.fill_count : 0;
+            if (summary.first_buy_ts_ms != null && (firstBuyTs == null || summary.first_buy_ts_ms < firstBuyTs)) {
+                firstBuyTs = summary.first_buy_ts_ms;
             }
-            if (agg.lastSellTs != null && (lastSellTs == null || agg.lastSellTs > lastSellTs)) {
-                lastSellTs = agg.lastSellTs;
+            if (summary.last_sell_ts_ms != null && (lastSellTs == null || summary.last_sell_ts_ms > lastSellTs)) {
+                lastSellTs = summary.last_sell_ts_ms;
+            }
+
+            for (StatsItem item : cache.getItems()) {
+                if (item == null || item.item_id <= 0) {
+                    continue;
+                }
+                StatsItem merged = mergedItems.computeIfAbsent(item.item_id, keyItem -> {
+                    StatsItem next = new StatsItem();
+                    next.item_id = keyItem;
+                    next.item_name = item.item_name;
+                    next.total_profit_gp = 0L;
+                    next.total_cost_gp = 0L;
+                    next.total_qty = 0;
+                    next.fill_count = 0;
+                    next.last_sell_ts_ms = item.last_sell_ts_ms;
+                    return next;
+                });
+                long profit = item.total_profit_gp != null ? item.total_profit_gp : 0L;
+                long cost = item.total_cost_gp != null ? item.total_cost_gp : 0L;
+                int qty = item.total_qty != null ? item.total_qty : 0;
+                int fills = item.fill_count != null ? item.fill_count : 0;
+                merged.total_profit_gp = (merged.total_profit_gp != null ? merged.total_profit_gp : 0L) + profit;
+                merged.total_cost_gp = (merged.total_cost_gp != null ? merged.total_cost_gp : 0L) + cost;
+                merged.total_qty = (merged.total_qty != null ? merged.total_qty : 0) + qty;
+                merged.fill_count = (merged.fill_count != null ? merged.fill_count : 0) + fills;
+                if (merged.item_name == null || merged.item_name.trim().isEmpty()) {
+                    merged.item_name = item.item_name;
+                }
+                if (item.last_sell_ts_ms != null
+                    && (merged.last_sell_ts_ms == null || item.last_sell_ts_ms > merged.last_sell_ts_ms)) {
+                    merged.last_sell_ts_ms = item.last_sell_ts_ms;
+                }
             }
         }
 
-        items.sort(buildLocalStatsComparator(sort));
+        List<StatsItem> items = new ArrayList<>(mergedItems.values());
+        StatsSummary summary = finalizeAccountwideSnapshot(items, sort, totalProfit, totalCost, totalQty, totalTax,
+            totalActiveMs, totalCompleted, firstBuyTs, lastSellTs);
+        return new LocalStatsSnapshot(summary, items);
+    }
 
+    private StatsSummary finalizeAccountwideSnapshot(List<StatsItem> items,
+                                                     StatsItemSort sort,
+                                                     long totalProfit,
+                                                     long totalCost,
+                                                     long totalQty,
+                                                     long totalTax,
+                                                     long totalActiveMs,
+                                                     int totalCompleted,
+                                                     Long firstBuyTs,
+                                                     Long lastSellTs) {
+        if (items != null) {
+            for (StatsItem item : items) {
+                if (item == null) {
+                    continue;
+                }
+                long cost = item.total_cost_gp != null ? item.total_cost_gp : 0L;
+                long profit = item.total_profit_gp != null ? item.total_profit_gp : 0L;
+                item.roi_percent = cost > 0 ? (profit * 100.0) / cost : 0.0;
+            }
+            hydrateLocalItemNames(items);
+            items.sort(buildLocalStatsComparator(sort));
+        }
         StatsSummary summary = new StatsSummary();
         summary.total_profit_gp = totalProfit;
         summary.total_cost_gp = totalCost;
@@ -3803,8 +4480,54 @@ public class GeLifecyclePlugin extends Plugin {
         summary.tax_paid_gp = totalTax;
         summary.first_buy_ts_ms = firstBuyTs;
         summary.last_sell_ts_ms = lastSellTs;
+        return summary;
+    }
 
-        return new LocalStatsSnapshot(summary, items);
+    private LocalStatsCache getOrBuildStatsCache(long accountKey) {
+        if (accountKey <= 0) {
+            return null;
+        }
+        LocalStatsCache cache = statsCacheByAccount.get(accountKey);
+        if (cache != null) {
+            return cache;
+        }
+        List<LocalTradeDelta> snapshot;
+        synchronized (localStatsLock) {
+            List<LocalTradeDelta> deltas = localTradeDeltasByAccount.get(accountKey);
+            snapshot = deltas != null ? new ArrayList<>(deltas) : new ArrayList<>();
+        }
+        LocalStatsCache created = new LocalStatsCache();
+        created.rebuild(snapshot);
+        statsCacheByAccount.put(accountKey, created);
+        return created;
+    }
+
+    private void rebuildStatsCache(long accountKey, List<LocalTradeDelta> deltas) {
+        if (accountKey <= 0) {
+            return;
+        }
+        LocalStatsCache cache = new LocalStatsCache();
+        cache.rebuild(deltas != null ? deltas : new ArrayList<>());
+        statsCacheByAccount.put(accountKey, cache);
+    }
+
+    private void applyDeltaToStatsCache(long accountKey, LocalTradeDelta delta) {
+        if (accountKey <= 0 || delta == null) {
+            return;
+        }
+        LocalStatsCache cache = statsCacheByAccount.get(accountKey);
+        if (cache == null) {
+            cache = new LocalStatsCache();
+            statsCacheByAccount.put(accountKey, cache);
+        }
+        if (!cache.applyDeltaInOrder(delta)) {
+            List<LocalTradeDelta> snapshot;
+            synchronized (localStatsLock) {
+                List<LocalTradeDelta> deltas = localTradeDeltasByAccount.get(accountKey);
+                snapshot = deltas != null ? new ArrayList<>(deltas) : new ArrayList<>();
+            }
+            rebuildStatsCache(accountKey, snapshot);
+        }
     }
 
     private Comparator<StatsItem> buildLocalStatsComparator(StatsItemSort sort) {
@@ -3851,6 +4574,436 @@ public class GeLifecyclePlugin extends Plugin {
         return -1L;
     }
 
+    private void loadProfileSelectionState() {
+        if (configManager == null) {
+            return;
+        }
+        String storedKey = configManager.getConfiguration("fliphub", PROFILE_SELECTED_KEY);
+        String mode = configManager.getConfiguration("fliphub", PROFILE_SELECTION_MODE_KEY);
+        if (storedKey != null && !storedKey.trim().isEmpty()) {
+            selectedProfileKey = storedKey.trim();
+        }
+        manualProfileSelection = "manual".equalsIgnoreCase(mode);
+    }
+
+    private void persistProfileSelectionState() {
+        if (configManager == null) {
+            return;
+        }
+        configManager.setConfiguration("fliphub", PROFILE_SELECTED_KEY, selectedProfileKey);
+        configManager.setConfiguration("fliphub", PROFILE_SELECTION_MODE_KEY, manualProfileSelection ? "manual" : "auto");
+    }
+
+    private void updateProfileForLogin() {
+        long accountHash = resolveAccountHash();
+        if (accountHash <= 0) {
+            return;
+        }
+        String displayName = resolveDisplayName();
+        if (displayName != null && !displayName.trim().isEmpty()) {
+            profileDisplayNames.put(accountHash, displayName.trim());
+        }
+        ensureProfileLoaded(accountHash);
+        if (!manualProfileSelection) {
+            selectedProfileKey = buildProfileKey(accountHash);
+            persistProfileSelectionState();
+        }
+        updateProfileOptionsUI();
+        updateProfileHeader();
+    }
+
+    private void updateProfileOptionsUI() {
+        if (panel == null) {
+            return;
+        }
+        List<FlipHubPanel.ProfileOption> options = buildProfileOptions();
+        panel.setProfileOptions(options, resolveSelectedProfileKeyForUi());
+    }
+
+    private void updateProfileHeader() {
+        if (panel == null) {
+            return;
+        }
+        String label = resolveProfileHeaderLabel();
+        panel.setProfileHeader(label, isLinked());
+    }
+
+    private String resolveSelectedProfileKeyForUi() {
+        if (client == null || client.getGameState() != GameState.LOGGED_IN) {
+            return ACCOUNTWIDE_KEY_STRING;
+        }
+        if (selectedProfileKey == null || selectedProfileKey.trim().isEmpty()) {
+            return ACCOUNTWIDE_KEY_STRING;
+        }
+        String normalized = selectedProfileKey.trim().toLowerCase(Locale.US);
+        if (ACCOUNTWIDE_KEY_STRING.equals(normalized)) {
+            return ACCOUNTWIDE_KEY_STRING;
+        }
+        if (normalized.startsWith("hash_")) {
+            return normalized;
+        }
+        try {
+            long parsed = Long.parseLong(normalized);
+            return parsed > 0 ? "hash_" + parsed : ACCOUNTWIDE_KEY_STRING;
+        } catch (Exception ignored) {
+        }
+        return ACCOUNTWIDE_KEY_STRING;
+    }
+
+    private String resolveProfileHeaderLabel() {
+        return resolveSelectedProfileLabel();
+    }
+
+    private boolean isLinked() {
+        String sessionToken = config != null ? config.sessionToken() : null;
+        String signingSecret = config != null ? config.signingSecret() : null;
+        return sessionToken != null && !sessionToken.isEmpty()
+            && signingSecret != null && !signingSecret.isEmpty();
+    }
+
+    private long resolveSelectedProfileKey() {
+        if (client == null || client.getGameState() != GameState.LOGGED_IN) {
+            return ACCOUNTWIDE_KEY;
+        }
+        String key = selectedProfileKey;
+        if (key == null || key.trim().isEmpty()) {
+            return ACCOUNTWIDE_KEY;
+        }
+        String normalized = key.trim().toLowerCase(Locale.US);
+        if (ACCOUNTWIDE_KEY_STRING.equals(normalized)) {
+            return ACCOUNTWIDE_KEY;
+        }
+        if (normalized.startsWith("hash_")) {
+            try {
+                return Long.parseLong(normalized.substring(5));
+            } catch (Exception ignored) {
+            }
+        }
+        try {
+            return Long.parseLong(normalized);
+        } catch (Exception ignored) {
+        }
+        return ACCOUNTWIDE_KEY;
+    }
+
+    private String resolveSelectedProfileLabel() {
+        long key = resolveSelectedProfileKey();
+        if (key == ACCOUNTWIDE_KEY) {
+            return "Accountwide";
+        }
+        String displayName = profileDisplayNames.get(key);
+        if (displayName != null && !displayName.trim().isEmpty() && !isPlaceholderDisplayName(displayName)) {
+            return displayName;
+        }
+        String legacyKey = legacyNameKeysByHash.get(key);
+        String legacyDisplay = displayNameFromLegacyKey(legacyKey);
+        if (legacyDisplay == null) {
+            legacyDisplay = resolveLegacyDisplayNameForHash(key);
+        }
+        if (legacyDisplay != null) {
+            profileDisplayNames.put(key, legacyDisplay);
+            return legacyDisplay;
+        }
+        if (displayName != null && !displayName.trim().isEmpty()) {
+            return displayName;
+        }
+        return "Profile " + key;
+    }
+
+    private String buildProfileKey(long accountHash) {
+        if (accountHash <= 0) {
+            return ACCOUNTWIDE_KEY_STRING;
+        }
+        return "hash_" + accountHash;
+    }
+
+    private String resolveDisplayName() {
+        try {
+            String name = client.getLocalPlayer() != null ? client.getLocalPlayer().getName() : null;
+            return name != null ? name.trim() : null;
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    private List<FlipHubPanel.ProfileOption> buildProfileOptions() {
+        List<FlipHubPanel.ProfileOption> options = new ArrayList<>();
+        options.add(new FlipHubPanel.ProfileOption(ACCOUNTWIDE_KEY_STRING, "Accountwide"));
+        Map<Long, String> diskProfiles = loadProfilesFromDisk();
+        long currentHash = resolveAccountHash();
+        if (currentHash > 0) {
+            String display = resolveDisplayName();
+            if (display != null && !display.trim().isEmpty()) {
+                diskProfiles.put(currentHash, display.trim());
+            } else if (!diskProfiles.containsKey(currentHash)) {
+                diskProfiles.put(currentHash, "Profile " + currentHash);
+            }
+        }
+        List<Map.Entry<Long, String>> entries = new ArrayList<>(diskProfiles.entrySet());
+        entries.sort(Comparator.comparing(entry -> entry.getValue() != null ? entry.getValue().toLowerCase(Locale.US) : ""));
+        for (Map.Entry<Long, String> entry : entries) {
+            long hash = entry.getKey();
+            if (hash <= 0) {
+                continue;
+            }
+            String label = entry.getValue();
+            if (label == null || label.trim().isEmpty()) {
+                label = "Profile " + hash;
+            }
+            if (label.startsWith("Profile ")) {
+                String legacyKey = legacyNameKeysByHash.get(hash);
+                String legacyDisplay = displayNameFromLegacyKey(legacyKey);
+                if (legacyDisplay == null) {
+                    legacyDisplay = resolveLegacyDisplayNameForHash(hash);
+                }
+                if (legacyDisplay != null) {
+                    label = legacyDisplay;
+                }
+            }
+            if (label != null && !label.trim().isEmpty() && !isPlaceholderDisplayName(label)) {
+                profileDisplayNames.put(hash, label.trim());
+            }
+            options.add(new FlipHubPanel.ProfileOption(buildProfileKey(hash), label));
+        }
+        return options;
+    }
+
+    private String resolveLegacyDisplayNameForHash(long hash) {
+        if (hash <= 0) {
+            return null;
+        }
+        Map<String, String> entries = getLegacyLocalTradesCache();
+        if (entries == null || entries.isEmpty()) {
+            return null;
+        }
+        String raw = entries.get("hash_" + hash);
+        if (raw == null || raw.trim().isEmpty()) {
+            raw = entries.get(String.valueOf(hash));
+        }
+        if (raw == null || raw.trim().isEmpty()) {
+            return null;
+        }
+        for (Map.Entry<String, String> entry : entries.entrySet()) {
+            if (entry == null) {
+                continue;
+            }
+            String key = entry.getKey();
+            String value = entry.getValue();
+            if (key == null || value == null) {
+                continue;
+            }
+            if (!value.equals(raw)) {
+                continue;
+            }
+            String normalized = key.trim().toLowerCase(Locale.US);
+            if (normalized.startsWith("name_")) {
+                String display = normalized.substring(5).trim();
+                return display.isEmpty() ? null : display;
+            }
+        }
+        return null;
+    }
+
+    private String displayNameFromLegacyKey(String legacyKey) {
+        if (legacyKey == null) {
+            return null;
+        }
+        String trimmed = legacyKey.trim();
+        if (trimmed.isEmpty()) {
+            return null;
+        }
+        if (trimmed.startsWith("name_")) {
+            String display = trimmed.substring(5).trim();
+            return display.isEmpty() ? null : display;
+        }
+        return null;
+    }
+
+    private Map<Long, String> loadProfilesFromDisk() {
+        Map<Long, String> profiles = new HashMap<>();
+        profiles.putAll(profileDisplayNames);
+        mergeProfilesFromDir(profiles, getProfilesDir());
+        mergeProfilesFromDir(profiles, getLegacyProfilesDir());
+        mergeProfilesFromLegacyConfig(profiles);
+        profileDisplayNames.putAll(profiles);
+        return profiles;
+    }
+
+    private void mergeProfilesFromLegacyConfig(Map<Long, String> profiles) {
+        Map<String, String> entries = getLegacyLocalTradesCache();
+        if (entries == null || entries.isEmpty()) {
+            return;
+        }
+        Map<String, String> nameValueToDisplay = new HashMap<>();
+        Map<String, String> nameValueToKey = new HashMap<>();
+        for (String key : entries.keySet()) {
+            if (key == null || key.trim().isEmpty()) {
+                continue;
+            }
+            String normalized = key.trim().toLowerCase(Locale.US);
+            if (normalized.startsWith("name_")) {
+                String display = normalized.substring(5).trim();
+                if (display.isEmpty()) {
+                    continue;
+                }
+                String raw = entries.get(key);
+                if (raw != null && !raw.trim().isEmpty()) {
+                    nameValueToDisplay.putIfAbsent(raw, display);
+                    nameValueToKey.putIfAbsent(raw, normalized);
+                }
+            } else if (normalized.startsWith("hash_")) {
+                try {
+                    long hash = Long.parseLong(normalized.substring(5));
+                    if (hash > 0) {
+                        String raw = entries.get(key);
+                        String display = raw != null ? nameValueToDisplay.get(raw) : null;
+                        if (display != null && !display.trim().isEmpty()) {
+                            String existing = profiles.get(hash);
+                            if (existing == null || existing.startsWith("Profile ")) {
+                                profiles.put(hash, display);
+                            }
+                            String nameKey = nameValueToKey.get(raw);
+                            if (nameKey != null) {
+                                legacyNameKeysByHash.putIfAbsent(hash, nameKey);
+                            }
+                        } else {
+                            if (!profiles.containsKey(hash)) {
+                                profiles.put(hash, "Profile " + hash);
+                            }
+                        }
+                    }
+                } catch (Exception ignored) {
+                }
+            } else {
+                try {
+                    long hash = Long.parseLong(normalized);
+                    if (hash > 0) {
+                        String raw = entries.get(key);
+                        String display = raw != null ? nameValueToDisplay.get(raw) : null;
+                        if (display != null && !display.trim().isEmpty()) {
+                            String existing = profiles.get(hash);
+                            if (existing == null || existing.startsWith("Profile ")) {
+                                profiles.put(hash, display);
+                            }
+                            String nameKey = nameValueToKey.get(raw);
+                            if (nameKey != null) {
+                                legacyNameKeysByHash.putIfAbsent(hash, nameKey);
+                            }
+                        } else {
+                            if (!profiles.containsKey(hash)) {
+                                profiles.put(hash, "Profile " + hash);
+                            }
+                        }
+                    }
+                } catch (Exception ignored) {
+                }
+            }
+        }
+    }
+
+    private void mergeProfilesFromDir(Map<Long, String> profiles, Path dir) {
+        if (dir == null || !Files.exists(dir)) {
+            return;
+        }
+        try (DirectoryStream<Path> stream = Files.newDirectoryStream(dir, "hash_*.json")) {
+            for (Path path : stream) {
+                String fileName = path.getFileName().toString();
+                if (!fileName.startsWith("hash_")) {
+                    continue;
+                }
+                String hashPart = fileName.substring(5, fileName.length() - ".json".length());
+                long hash;
+                try {
+                    hash = Long.parseLong(hashPart);
+                } catch (Exception ex) {
+                    continue;
+                }
+                ProfileData data = readProfileData(path);
+                if (data != null && data.displayName != null && !data.displayName.trim().isEmpty()) {
+                    profiles.put(hash, data.displayName.trim());
+                } else if (!profiles.containsKey(hash)) {
+                    profiles.put(hash, "Profile " + hash);
+                }
+            }
+        } catch (IOException ignored) {
+        }
+    }
+
+    private Map<String, String> getLegacyLocalTradesCache() {
+        Map<String, String> cache = legacyLocalTradesCache;
+        if (cache != null) {
+            return cache;
+        }
+        synchronized (legacyLocalTradesLock) {
+            if (legacyLocalTradesCache != null) {
+                return legacyLocalTradesCache;
+            }
+            Map<String, String> next = new HashMap<>();
+            loadLegacyLocalTradesFromProfiles(next);
+            legacyLocalTradesCache = next;
+            return next;
+        }
+    }
+
+    private void loadLegacyLocalTradesFromProfiles(Map<String, String> target) {
+        if (target == null) {
+            return;
+        }
+        String home = System.getProperty("user.home");
+        if (home == null || home.trim().isEmpty()) {
+            return;
+        }
+        Path profilesDir = Paths.get(home, ".runelite", "profiles2");
+        if (Files.exists(profilesDir)) {
+            try (DirectoryStream<Path> stream = Files.newDirectoryStream(profilesDir, "*.properties")) {
+                for (Path path : stream) {
+                    loadLegacyLocalTradesFromFile(target, path);
+                }
+            } catch (IOException ignored) {
+            }
+        }
+        Path settingsFile = Paths.get(home, ".runelite", "settings.properties");
+        loadLegacyLocalTradesFromFile(target, settingsFile);
+    }
+
+    private void loadLegacyLocalTradesFromFile(Map<String, String> target, Path path) {
+        if (target == null || path == null || !Files.exists(path)) {
+            return;
+        }
+        java.util.Properties props = new java.util.Properties();
+        try (java.io.InputStream in = Files.newInputStream(path)) {
+            props.load(in);
+        } catch (Exception ignored) {
+            return;
+        }
+        for (Map.Entry<Object, Object> entry : props.entrySet()) {
+            if (entry == null || entry.getKey() == null || entry.getValue() == null) {
+                continue;
+            }
+            String key = String.valueOf(entry.getKey());
+            if (!key.startsWith(LEGACY_CONFIG_GROUP + ".localTrades.")) {
+                continue;
+            }
+            String suffix = key.substring((LEGACY_CONFIG_GROUP + ".localTrades.").length());
+            String value = String.valueOf(entry.getValue());
+            if (!suffix.isEmpty() && value != null && !value.trim().isEmpty()) {
+                target.putIfAbsent(suffix, value);
+            }
+        }
+    }
+
+    private long deriveNameHash(String name) {
+        if (name == null) {
+            return 1L;
+        }
+        String trimmed = name.trim().toLowerCase(Locale.US);
+        if (trimmed.isEmpty()) {
+            return 1L;
+        }
+        long fallback = trimmed.hashCode();
+        return fallback != 0 ? Math.abs(fallback) : 1L;
+    }
+
     private void maybeMergeLocalAccounts(long accountHash, long nameKey) {
         if (accountHash <= 0 || nameKey <= 0 || accountHash == nameKey) {
             return;
@@ -3864,6 +5017,7 @@ public class GeLifecyclePlugin extends Plugin {
     }
 
     private void mergeLocalAccountData(long targetKey, long sourceKey) {
+        List<LocalTradeDelta> mergedSnapshot = null;
         synchronized (localStatsLock) {
             List<LocalTradeDelta> target = localTradeDeltasByAccount.get(targetKey);
             List<LocalTradeDelta> source = localTradeDeltasByAccount.remove(sourceKey);
@@ -3889,6 +5043,10 @@ public class GeLifecyclePlugin extends Plugin {
                     }
                 }
             }
+            List<LocalTradeDelta> updated = localTradeDeltasByAccount.get(targetKey);
+            if (updated != null) {
+                mergedSnapshot = new ArrayList<>(updated);
+            }
 
             Long targetStart = localSessionStartByAccount.get(targetKey);
             Long sourceStart = localSessionStartByAccount.remove(sourceKey);
@@ -3898,6 +5056,10 @@ public class GeLifecyclePlugin extends Plugin {
                 }
             }
         }
+        if (mergedSnapshot != null) {
+            rebuildStatsCache(targetKey, mergedSnapshot);
+        }
+        statsCacheByAccount.remove(sourceKey);
     }
 
     private long resolveNameAccountKey() {
@@ -3956,7 +5118,7 @@ public class GeLifecyclePlugin extends Plugin {
 
     private void updateLocalAccountSessionStart() {
         long nowMs = System.currentTimeMillis();
-        long accountKey = resolveLocalAccountKey();
+        long accountKey = resolveAccountHash();
         if (accountKey <= 0) {
             return;
         }
@@ -4251,7 +5413,7 @@ public class GeLifecyclePlugin extends Plugin {
     private WikiPriceEntry getWikiPriceEntry(int itemId, boolean allowRefresh) {
         long now = System.currentTimeMillis();
         if (allowRefresh && (wikiLatestFetchedMs <= 0 || now - wikiLatestFetchedMs > WIKI_CACHE_TTL_MS)) {
-            refreshWikiLatestPrices();
+            requestWikiLatestFetch(true);
         }
         synchronized (wikiPriceLock) {
             return wikiLatestCache.get(itemId);
@@ -4259,58 +5421,116 @@ public class GeLifecyclePlugin extends Plugin {
     }
 
     private void refreshWikiLatestPrices() {
-        long now = System.currentTimeMillis();
-        if (wikiLatestFetchedMs > 0 && now - wikiLatestFetchedMs <= WIKI_CACHE_TTL_MS) {
+        requestWikiLatestFetch(false);
+    }
+
+    private void startWikiFetcher() {
+        if (scheduler == null) {
+            return;
+        }
+        if (wikiFetchTask != null && !wikiFetchTask.isCancelled()) {
+            return;
+        }
+        wikiFetchTask = scheduler.scheduleAtFixedRate(this::tickWikiFetch, 5, 1, TimeUnit.SECONDS);
+    }
+
+    private void stopWikiFetcher() {
+        if (wikiFetchTask != null) {
+            wikiFetchTask.cancel(true);
+            wikiFetchTask = null;
+        }
+        wikiFetchInFlight.set(false);
+    }
+
+    private void tickWikiFetch() {
+        requestWikiLatestFetch(false);
+    }
+
+    private void requestWikiLatestFetch(boolean allowWhenHidden) {
+        if (!shouldFetchWikiLatest(allowWhenHidden)) {
             return;
         }
         if (!wikiFetchInFlight.compareAndSet(false, true)) {
             return;
         }
-        try {
-            Request request = new Request.Builder()
-                .url(WIKI_LATEST_URL)
-                .get()
-                .addHeader("User-Agent", WIKI_USER_AGENT)
-                .addHeader("Accept", "application/json")
-                .build();
-            try (Response response = httpClient.newCall(request).execute()) {
-                if (!response.isSuccessful()) {
-                    return;
-                }
-                String body = response.body() != null ? response.body().string() : null;
-                if (body == null || body.isEmpty() || gson == null) {
-                    return;
-                }
-                WikiLatestResponse latest = gson.fromJson(body, WikiLatestResponse.class);
-                if (latest == null || latest.data == null) {
-                    return;
-                }
-                Map<Integer, WikiPriceEntry> next = new HashMap<>();
-                for (Map.Entry<String, WikiPriceEntry> entry : latest.data.entrySet()) {
-                    if (entry == null || entry.getKey() == null || entry.getValue() == null) {
-                        continue;
-                    }
-                    try {
-                        int itemId = Integer.parseInt(entry.getKey());
-                        if (itemId > 0) {
-                            next.put(itemId, entry.getValue());
-                        }
-                    } catch (NumberFormatException ignored) {
-                    }
-                }
-                synchronized (wikiPriceLock) {
-                    wikiLatestCache.clear();
-                    wikiLatestCache.putAll(next);
-                    wikiLatestFetchedMs = now;
-                }
-            }
-        } catch (IOException ex) {
-            if (log.isDebugEnabled()) {
-                log.debug("Wiki price refresh failed: {}", ex.getMessage());
-            }
-        } finally {
+        long attemptMs = System.currentTimeMillis();
+        wikiLastAttemptMs.set(attemptMs);
+        if (httpClient == null || gson == null) {
             wikiFetchInFlight.set(false);
+            return;
         }
+        Request request = new Request.Builder()
+            .url(WIKI_LATEST_URL)
+            .get()
+            .addHeader("User-Agent", WIKI_USER_AGENT)
+            .addHeader("Accept", "application/json")
+            .build();
+        httpClient.newCall(request).enqueue(new Callback() {
+            @Override
+            public void onFailure(Call call, IOException e) {
+                wikiFetchInFlight.set(false);
+            }
+
+            @Override
+            public void onResponse(Call call, Response response) {
+                try (ResponseBody responseBody = response.body()) {
+                    if (!response.isSuccessful()) {
+                        return;
+                    }
+                    String body = responseBody != null ? responseBody.string() : null;
+                    if (body == null || body.isEmpty()) {
+                        return;
+                    }
+                    WikiLatestResponse latest = gson.fromJson(body, WikiLatestResponse.class);
+                    if (latest == null || latest.data == null) {
+                        return;
+                    }
+                    Map<Integer, WikiPriceEntry> next = new HashMap<>();
+                    for (Map.Entry<String, WikiPriceEntry> entry : latest.data.entrySet()) {
+                        if (entry == null || entry.getKey() == null || entry.getValue() == null) {
+                            continue;
+                        }
+                        try {
+                            int itemId = Integer.parseInt(entry.getKey());
+                            if (itemId > 0) {
+                                next.put(itemId, entry.getValue());
+                            }
+                        } catch (NumberFormatException ignored) {
+                        }
+                    }
+                    long completedMs = System.currentTimeMillis();
+                    synchronized (wikiPriceLock) {
+                        wikiLatestCache.clear();
+                        wikiLatestCache.putAll(next);
+                        wikiLatestFetchedMs = completedMs;
+                    }
+                } catch (Exception ex) {
+                    if (log.isDebugEnabled()) {
+                        log.debug("Wiki price refresh failed: {}", ex.getMessage());
+                    }
+                } finally {
+                    wikiFetchInFlight.set(false);
+                }
+            }
+        });
+    }
+
+    private boolean shouldFetchWikiLatest(boolean allowWhenHidden) {
+        long now = System.currentTimeMillis();
+        if (!allowWhenHidden && !panelVisible) {
+            return false;
+        }
+        if (wikiFetchInFlight.get()) {
+            return false;
+        }
+        if (wikiLatestFetchedMs > 0 && now - wikiLatestFetchedMs <= WIKI_CACHE_TTL_MS) {
+            return false;
+        }
+        long lastAttempt = wikiLastAttemptMs.get();
+        if (lastAttempt > 0 && now - lastAttempt < WIKI_MIN_REFRESH_MS) {
+            return false;
+        }
+        return true;
     }
 
     private void primeOfferSnapshots() {
@@ -4331,6 +5551,13 @@ public class GeLifecyclePlugin extends Plugin {
                 snapshots.put(slot, snapshot);
             }
         }
+    }
+
+    private static final class ProfileData {
+        private long accountHash;
+        private String displayName;
+        private List<LocalTradeDelta> deltas;
+        private long updatedMs;
     }
 
     private static final class LocalTradeDelta {
@@ -4418,6 +5645,210 @@ public class GeLifecyclePlugin extends Plugin {
         private LocalItemAgg(int itemId) {
             this.itemId = itemId;
         }
+    }
+
+        private static final class LocalStatsCache {
+            private final Map<Integer, LocalItemAgg> itemAggs = new HashMap<>();
+            private final Map<Integer, LocalInventoryState> inventory = new HashMap<>();
+            private final List<LocalTradeDelta> sortedDeltas = new ArrayList<>();
+            private long lastTs = Long.MIN_VALUE;
+            private long totalProfit;
+            private long totalCost;
+            private long totalQty;
+        private long totalTax;
+        private long totalActiveMs;
+        private int totalCompleted;
+        private Long firstBuyTs;
+        private Long lastSellTs;
+
+        private void rebuild(List<LocalTradeDelta> deltas) {
+            itemAggs.clear();
+            inventory.clear();
+            sortedDeltas.clear();
+            lastTs = Long.MIN_VALUE;
+            totalProfit = 0L;
+            totalCost = 0L;
+            totalQty = 0L;
+            totalTax = 0L;
+            totalActiveMs = 0L;
+            totalCompleted = 0;
+            firstBuyTs = null;
+            lastSellTs = null;
+            if (deltas == null || deltas.isEmpty()) {
+                return;
+            }
+            List<LocalTradeDelta> snapshot = new ArrayList<>(deltas);
+            snapshot.sort(Comparator
+                .comparingLong((LocalTradeDelta delta) -> delta != null ? delta.tsClientMs / LOCAL_EVENT_BUCKET_MS : 0L)
+                .thenComparingInt(delta -> delta != null && delta.isBuy ? 0 : 1)
+                .thenComparingLong(delta -> delta != null ? delta.tsClientMs : 0L));
+            sortedDeltas.addAll(snapshot);
+            LocalTradeDelta last = snapshot.get(snapshot.size() - 1);
+            if (last != null) {
+                lastTs = last.tsClientMs;
+            }
+            for (LocalTradeDelta delta : snapshot) {
+                applyDelta(delta);
+            }
+        }
+
+        private boolean applyDeltaInOrder(LocalTradeDelta delta) {
+            if (delta == null) {
+                return false;
+            }
+            if (lastTs != Long.MIN_VALUE && delta.tsClientMs < lastTs) {
+                return false;
+            }
+            sortedDeltas.add(delta);
+            lastTs = Math.max(lastTs, delta.tsClientMs);
+            applyDelta(delta);
+            return true;
+        }
+
+        private LocalStatsSnapshot buildSnapshotSince(Long sinceMs) {
+            if (sinceMs == null) {
+                return new LocalStatsSnapshot(getSummary(), getItems());
+            }
+            LocalStatsCache window = new LocalStatsCache();
+            for (LocalTradeDelta delta : sortedDeltas) {
+                if (delta == null) {
+                    continue;
+                }
+                if (delta.tsClientMs < sinceMs) {
+                    continue;
+                }
+                window.applyDelta(delta);
+            }
+            return new LocalStatsSnapshot(window.getSummary(), window.getItems());
+        }
+
+        private void applyDelta(LocalTradeDelta delta) {
+            if (delta == null) {
+                return;
+            }
+            boolean isCompletion = "OFFER_COMPLETED".equals(delta.eventType);
+            if (delta.deltaQty <= 0 && !isCompletion) {
+                return;
+            }
+            LocalInventoryState state = inventory.computeIfAbsent(delta.itemId, LocalInventoryState::new);
+            if (delta.isBuy) {
+                if (delta.deltaQty <= 0) {
+                    return;
+                }
+                state.qty += delta.deltaQty;
+                state.cost += Math.max(0L, delta.deltaGp);
+                if (state.firstBuyTs == null || delta.tsClientMs < state.firstBuyTs) {
+                    state.firstBuyTs = delta.tsClientMs;
+                }
+                return;
+            }
+
+            if (state.qty <= 0 && !isCompletion) {
+                return;
+            }
+
+            long matchQty = 0L;
+            long matchCost = 0L;
+            long matchRevenue = 0L;
+            Long matchedBuyTs = state.firstBuyTs;
+            if (delta.deltaQty > 0 && state.qty > 0) {
+                matchQty = Math.min((long) delta.deltaQty, state.qty);
+                if (matchQty > 0) {
+                    matchRevenue = delta.deltaGp;
+                    if (matchQty < delta.deltaQty) {
+                        matchRevenue = (delta.deltaGp * matchQty) / delta.deltaQty;
+                    }
+                    if (matchQty >= state.qty) {
+                        matchCost = state.cost;
+                        state.qty = 0L;
+                        state.cost = 0L;
+                        state.firstBuyTs = null;
+                    } else {
+                        matchCost = (state.cost * matchQty) / state.qty;
+                        state.qty -= matchQty;
+                        state.cost = Math.max(0L, state.cost - matchCost);
+                    }
+                }
+            }
+
+            LocalItemAgg agg = itemAggs.computeIfAbsent(delta.itemId, LocalItemAgg::new);
+            if (matchQty > 0) {
+                agg.buyCost += matchCost;
+                agg.buyQty += matchQty;
+                agg.sellRevenue += Math.max(0L, matchRevenue);
+                agg.sellQty += matchQty;
+                long tax = ((long) delta.price * matchQty) / 50L;
+                agg.taxPaid += Math.max(0L, tax);
+                if (matchedBuyTs == null) {
+                    matchedBuyTs = delta.tsClientMs;
+                }
+                if (agg.firstBuyTs == null || matchedBuyTs < agg.firstBuyTs) {
+                    agg.firstBuyTs = matchedBuyTs;
+                }
+                long duration = delta.tsClientMs - matchedBuyTs;
+                if (duration > 0) {
+                    agg.activeMs += duration;
+                }
+                totalProfit += (Math.max(0L, matchRevenue) - matchCost);
+                totalCost += matchCost;
+                totalQty += matchQty;
+                totalTax += Math.max(0L, tax);
+                totalActiveMs += Math.max(0L, duration);
+            }
+            if (agg.lastSellTs == null || delta.tsClientMs > agg.lastSellTs) {
+                agg.lastSellTs = delta.tsClientMs;
+            }
+            if (isCompletion && !delta.isBuy) {
+                agg.completedSells += 1;
+                totalCompleted += 1;
+            }
+            if (agg.firstBuyTs != null && (firstBuyTs == null || agg.firstBuyTs < firstBuyTs)) {
+                firstBuyTs = agg.firstBuyTs;
+            }
+            if (agg.lastSellTs != null && (lastSellTs == null || agg.lastSellTs > lastSellTs)) {
+                lastSellTs = agg.lastSellTs;
+            }
+        }
+
+        private StatsSummary getSummary() {
+            StatsSummary summary = new StatsSummary();
+            summary.total_profit_gp = totalProfit;
+            summary.total_cost_gp = totalCost;
+            summary.roi_percent = totalCost > 0 ? (totalProfit * 100.0) / totalCost : 0.0;
+            summary.gp_per_hour = totalActiveMs > 0 ? (totalProfit / (totalActiveMs / 3600000.0)) : 0.0;
+            summary.fill_count = totalCompleted;
+            summary.total_qty = totalQty;
+            summary.active_ms = totalActiveMs;
+            summary.tax_paid_gp = totalTax;
+            summary.first_buy_ts_ms = firstBuyTs;
+            summary.last_sell_ts_ms = lastSellTs;
+            return summary;
+        }
+
+        private List<StatsItem> getItems() {
+            List<StatsItem> items = new ArrayList<>();
+            for (LocalItemAgg agg : itemAggs.values()) {
+                if (agg.buyQty <= 0 || agg.sellQty <= 0) {
+                    continue;
+                }
+                long profit = agg.sellRevenue - agg.buyCost;
+                long cost = agg.buyCost;
+                long qty = agg.sellQty;
+                double roi = cost > 0 ? (profit * 100.0) / cost : 0.0;
+
+                StatsItem item = new StatsItem();
+                item.item_id = agg.itemId;
+                item.total_profit_gp = profit;
+                item.total_cost_gp = cost;
+                item.roi_percent = roi;
+                item.total_qty = (int) Math.min(Integer.MAX_VALUE, Math.max(0, qty));
+                item.fill_count = agg.completedSells;
+                item.last_sell_ts_ms = agg.lastSellTs;
+                items.add(item);
+            }
+            return items;
+        }
+
     }
 
     private static final class LocalStatsSnapshot {
