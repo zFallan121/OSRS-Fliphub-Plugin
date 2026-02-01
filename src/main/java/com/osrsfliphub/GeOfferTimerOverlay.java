@@ -77,10 +77,6 @@ public class GeOfferTimerOverlay extends Overlay {
         if (offerContainer != null && !offerContainer.isHidden()) {
             return null;
         }
-        Widget offerText = client.getWidget(ComponentID.GRAND_EXCHANGE_OFFER_TEXT);
-        if (offerText != null && !offerText.isHidden()) {
-            return null;
-        }
         if (isOfferStatusWindowOpen()) {
             return null;
         }

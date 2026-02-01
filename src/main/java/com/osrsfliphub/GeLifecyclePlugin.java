@@ -1143,11 +1143,6 @@ public class GeLifecyclePlugin extends Plugin {
     }
 
     private Boolean findOfferTypeFromSetupWidgets() {
-        Widget offerText = client.getWidget(ComponentID.GRAND_EXCHANGE_OFFER_TEXT);
-        Boolean fromOfferText = findOfferTypeInWidget(offerText);
-        if (fromOfferText != null) {
-            return fromOfferText;
-        }
         Widget offerContainer = client.getWidget(ComponentID.GRAND_EXCHANGE_OFFER_CONTAINER);
         return findOfferTypeInWidget(offerContainer);
     }
@@ -2086,14 +2081,12 @@ public class GeLifecyclePlugin extends Plugin {
 
     private boolean updateOfferSetupItem() {
         Widget offerContainer = client.getWidget(ComponentID.GRAND_EXCHANGE_OFFER_CONTAINER);
-        Widget offerText = client.getWidget(ComponentID.GRAND_EXCHANGE_OFFER_TEXT);
-        boolean offerVisible = (offerText != null && !offerText.isHidden()) ||
-            (offerContainer != null && !offerContainer.isHidden());
+        boolean offerVisible = offerContainer != null && !offerContainer.isHidden();
         if (!offerVisible) {
             return false;
         }
 
-        String normalized = normalizeOfferText(offerText != null ? offerText.getText() : null);
+        String normalized = normalizeOfferText(offerContainer != null ? offerContainer.getText() : null);
         if (normalized != null) {
             String lower = normalized.toLowerCase();
             if (containsAny(lower, OFFER_SETUP_BLOCKERS)) {
@@ -2105,15 +2098,6 @@ public class GeLifecyclePlugin extends Plugin {
         int itemId = -1;
         if (offerContainer != null && !offerContainer.isHidden()) {
             itemId = findFirstItemId(offerContainer);
-        }
-        if (itemId <= 0 && offerText != null) {
-            Widget parent = offerText.getParent();
-            if (parent != null && parent != offerContainer && !parent.isHidden()) {
-                itemId = findFirstItemId(parent);
-            }
-        }
-        if (itemId <= 0 && offerText != null) {
-            itemId = findItemIdFromOfferText(offerText);
         }
         if (itemId <= 0) {
             clearOfferPreview();
