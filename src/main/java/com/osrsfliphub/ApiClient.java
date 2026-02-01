@@ -27,10 +27,6 @@ public class ApiClient {
         this.config = config;
     }
 
-    private String normalizeBaseUrl() {
-        return API_BASE_URL;
-    }
-
     public LinkResponse linkDevice(String licenseKey, String deviceId, String deviceName, String pluginVersion) throws Exception {
         Map<String, Object> body = new HashMap<>();
         body.put("license_key", licenseKey);
@@ -41,7 +37,7 @@ public class ApiClient {
 
         String json = gson.toJson(body);
         Request request = new Request.Builder()
-            .url(normalizeBaseUrl() + "/api/plugin/link")
+            .url(API_BASE_URL + "/api/plugin/link")
             .post(RequestBody.create(JSON, json))
             .build();
 
@@ -56,7 +52,7 @@ public class ApiClient {
 
     public LinkResponse refreshSession(String sessionToken) throws Exception {
         Request request = new Request.Builder()
-            .url(normalizeBaseUrl() + "/api/plugin/refresh")
+            .url(API_BASE_URL + "/api/plugin/refresh")
             .post(RequestBody.create(JSON, "{}"))
             .addHeader("X-Plugin-Token", sessionToken)
             .build();
@@ -96,7 +92,7 @@ public class ApiClient {
         String signature = Signer.hmacBase64(signingSecret, canonical);
 
         Request request = new Request.Builder()
-            .url(normalizeBaseUrl() + "/api/plugin/events")
+            .url(API_BASE_URL + "/api/plugin/events")
             .post(RequestBody.create(JSON, json))
             .addHeader("X-Plugin-Token", sessionToken)
             .addHeader("X-Nonce", nonce)
@@ -114,7 +110,7 @@ public class ApiClient {
 
     public ItemsResponse fetchItems(String sessionToken, String query, int page, int pageSize) throws Exception {
         StringBuilder urlBuilder = new StringBuilder();
-        urlBuilder.append(normalizeBaseUrl()).append("/api/plugin/items");
+        urlBuilder.append(API_BASE_URL).append("/api/plugin/items");
         urlBuilder.append("?page=").append(page).append("&page_size=").append(pageSize);
         if (query != null && !query.trim().isEmpty()) {
             urlBuilder.append("&q=").append(URLEncoder.encode(query.trim(), StandardCharsets.UTF_8));
@@ -136,7 +132,7 @@ public class ApiClient {
     }
 
     public ItemResponse fetchItem(String sessionToken, int itemId) throws Exception {
-        String url = normalizeBaseUrl() + "/api/plugin/item?item_id=" + itemId;
+        String url = API_BASE_URL + "/api/plugin/item?item_id=" + itemId;
         Request request = new Request.Builder()
             .url(url)
             .get()
@@ -154,7 +150,7 @@ public class ApiClient {
 
     public StatsSummaryResponse fetchStatsSummary(String sessionToken, Long sinceMs, Long untilMs) throws Exception {
         StringBuilder urlBuilder = new StringBuilder();
-        urlBuilder.append(normalizeBaseUrl()).append("/api/plugin/stats/summary");
+        urlBuilder.append(API_BASE_URL).append("/api/plugin/stats/summary");
         appendStatsQuery(urlBuilder, sinceMs, untilMs);
 
         Request request = new Request.Builder()
@@ -174,7 +170,7 @@ public class ApiClient {
 
     public StatsItemsResponse fetchStatsItems(String sessionToken, Long sinceMs, Long untilMs, Integer limit, StatsItemSort sort) throws Exception {
         StringBuilder urlBuilder = new StringBuilder();
-        urlBuilder.append(normalizeBaseUrl()).append("/api/plugin/stats/items");
+        urlBuilder.append(API_BASE_URL).append("/api/plugin/stats/items");
         boolean hasQuery = appendStatsQuery(urlBuilder, sinceMs, untilMs);
         if (limit != null) {
             urlBuilder.append(hasQuery ? "&" : "?").append("limit=").append(limit);
