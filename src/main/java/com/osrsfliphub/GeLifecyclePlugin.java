@@ -73,7 +73,6 @@ import org.slf4j.LoggerFactory;
     description = "Read-only GE offer lifecycle capture for FlipHub",
     configName = "fliphub",
     tags = {"ge", "flipping", "analytics"},
-    enabledByDefault = false,
     hidden = false,
     developerPlugin = false
 )
