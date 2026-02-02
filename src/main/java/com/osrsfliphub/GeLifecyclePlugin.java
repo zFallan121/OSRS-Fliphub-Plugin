@@ -84,9 +84,9 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 @PluginDescriptor(
-    name = "FlipHub OSRS",
+    name = "FlipHub OSRS (Dev)",
     description = "Read-only GE offer lifecycle capture for FlipHub",
-    configName = "fliphub",
+    configName = "fliphub_dev",
     tags = {"ge", "flipping", "analytics"},
     hidden = false,
     developerPlugin = false
@@ -393,7 +393,7 @@ public class GeLifecyclePlugin extends Plugin {
 
     @Subscribe
     public void onConfigChanged(ConfigChanged event) {
-        if (!"fliphub".equals(event.getGroup())) {
+        if (!"fliphub_dev".equals(event.getGroup())) {
             return;
         }
         if ("licenseKey".equals(event.getKey()) || "linkCode".equals(event.getKey())) {
@@ -406,11 +406,11 @@ public class GeLifecyclePlugin extends Plugin {
             if (!config.unlinkNow()) {
                 return;
             }
-            configManager.setConfiguration("fliphub", "sessionToken", "");
-            configManager.setConfiguration("fliphub", "signingSecret", "");
-            configManager.setConfiguration("fliphub", "licenseKey", "");
-            configManager.setConfiguration("fliphub", "linkCode", "");
-            configManager.setConfiguration("fliphub", "unlinkNow", false);
+            configManager.setConfiguration("fliphub_dev", "sessionToken", "");
+            configManager.setConfiguration("fliphub_dev", "signingSecret", "");
+            configManager.setConfiguration("fliphub_dev", "licenseKey", "");
+            configManager.setConfiguration("fliphub_dev", "linkCode", "");
+            configManager.setConfiguration("fliphub_dev", "unlinkNow", false);
             if (panel != null) {
                 updateProfileHeader();
             }
@@ -1960,7 +1960,7 @@ public class GeLifecyclePlugin extends Plugin {
         String deviceId = config.deviceId();
         if (deviceId == null || deviceId.trim().isEmpty()) {
             deviceId = UUID.randomUUID().toString();
-            configManager.setConfiguration("fliphub", "deviceId", deviceId);
+            configManager.setConfiguration("fliphub_dev", "deviceId", deviceId);
         }
     }
 
@@ -2051,7 +2051,7 @@ public class GeLifecyclePlugin extends Plugin {
             output.put(String.valueOf(entry.getKey()), entry.getValue());
         }
         String json = gson.toJson(output);
-        configManager.setConfiguration("fliphub", "geOfferUpdateTimes", json);
+        configManager.setConfiguration("fliphub_dev", "geOfferUpdateTimes", json);
     }
 
     private void persistBookmarks() {
@@ -2059,7 +2059,7 @@ public class GeLifecyclePlugin extends Plugin {
             .sorted()
             .map(String::valueOf)
             .collect(Collectors.joining(","));
-        configManager.setConfiguration("fliphub", "bookmarks", value);
+        configManager.setConfiguration("fliphub_dev", "bookmarks", value);
         if (panel != null) {
             panel.refreshBookmarks();
         }
@@ -2070,7 +2070,7 @@ public class GeLifecyclePlugin extends Plugin {
             .sorted()
             .map(String::valueOf)
             .collect(Collectors.joining(","));
-        configManager.setConfiguration("fliphub", "hiddenItems", value);
+        configManager.setConfiguration("fliphub_dev", "hiddenItems", value);
         if (panel != null) {
             panel.refreshBookmarks();
         }
@@ -2102,10 +2102,10 @@ public class GeLifecyclePlugin extends Plugin {
                 );
 
                 if (response.session_token != null && response.signing_secret != null) {
-                    configManager.setConfiguration("fliphub", "sessionToken", response.session_token);
-                    configManager.setConfiguration("fliphub", "signingSecret", response.signing_secret);
-                    configManager.setConfiguration("fliphub", "licenseKey", "");
-                    configManager.setConfiguration("fliphub", "linkCode", "");
+                    configManager.setConfiguration("fliphub_dev", "sessionToken", response.session_token);
+                    configManager.setConfiguration("fliphub_dev", "signingSecret", response.signing_secret);
+                    configManager.setConfiguration("fliphub_dev", "licenseKey", "");
+                    configManager.setConfiguration("fliphub_dev", "linkCode", "");
                     refreshPanelData();
                     if (panel != null) {
                         updateProfileHeader();
@@ -2175,6 +2175,9 @@ public class GeLifecyclePlugin extends Plugin {
             if (status == 401) {
                 boolean refreshed = attemptRefresh(sessionToken);
                 requeue(batch);
+                if (!refreshed) {
+                    clearSession();
+                }
                 if (!refreshed && panel != null && isPanelVisible()) {
                     updateProfileHeader();
                 }
@@ -2829,13 +2832,17 @@ public class GeLifecyclePlugin extends Plugin {
         try {
             ApiClient.LinkResponse response = apiClient.refreshSession(currentToken);
             if (response.session_token != null) {
-                configManager.setConfiguration("fliphub", "sessionToken", response.session_token);
+                configManager.setConfiguration("fliphub_dev", "sessionToken", response.session_token);
                 if (response.signing_secret != null && !response.signing_secret.isEmpty()) {
-                    configManager.setConfiguration("fliphub", "signingSecret", response.signing_secret);
+                    configManager.setConfiguration("fliphub_dev", "signingSecret", response.signing_secret);
                 }
                 return true;
             }
         } catch (Exception ex) {
+            String message = ex.getMessage();
+            if (message != null && (message.contains("401") || message.contains("403"))) {
+                clearSession();
+            }
             // Ignore; user can relink if needed
         }
         return false;
@@ -2845,8 +2852,8 @@ public class GeLifecyclePlugin extends Plugin {
         if (configManager == null) {
             return;
         }
-        configManager.setConfiguration("fliphub", "sessionToken", "");
-        configManager.setConfiguration("fliphub", "signingSecret", "");
+        configManager.setConfiguration("fliphub_dev", "sessionToken", "");
+        configManager.setConfiguration("fliphub_dev", "signingSecret", "");
     }
 
     private void renderLocalStats() {
@@ -2873,8 +2880,78 @@ public class GeLifecyclePlugin extends Plugin {
         LocalStatsSnapshot localStats = accountKey >= 0
             ? buildLocalStatsSnapshot(accountKey, sinceMs, sort)
             : new LocalStatsSnapshot(new StatsSummary(), new ArrayList<>());
+        if (accountKey == ACCOUNTWIDE_KEY && isLinked()) {
+            if (renderRemoteStats(nowMs, sinceMs, sort, localStats)) {
+                return;
+            }
+        }
         panel.setStatsSummary(localStats.summary, nowMs);
         panel.setStatsItems(localStats.items, nowMs);
+    }
+
+    private boolean renderRemoteStats(long nowMs, Long sinceMs, StatsItemSort sort, LocalStatsSnapshot fallback) {
+        if (panel == null || apiClient == null || config == null) {
+            return false;
+        }
+        String sessionToken = config.sessionToken();
+        if (sessionToken == null || sessionToken.isEmpty()) {
+            return false;
+        }
+        ApiClient.StatsSummaryResponse summaryResponse = fetchRemoteStatsSummary(sessionToken, sinceMs, true);
+        if (summaryResponse == null || summaryResponse.summary == null) {
+            return false;
+        }
+        ApiClient.StatsItemsResponse itemsResponse = fetchRemoteStatsItems(sessionToken, sinceMs, sort, true);
+
+        long summaryAsOf = summaryResponse.as_of_ms > 0 ? summaryResponse.as_of_ms : nowMs;
+        panel.setStatsSummary(summaryResponse.summary, summaryAsOf);
+
+        if (itemsResponse != null && itemsResponse.items != null) {
+            long itemsAsOf = itemsResponse.as_of_ms > 0 ? itemsResponse.as_of_ms : nowMs;
+            panel.setStatsItems(itemsResponse.items, itemsAsOf);
+        } else if (fallback != null) {
+            panel.setStatsItems(fallback.items, nowMs);
+        }
+        return true;
+    }
+
+    private ApiClient.StatsSummaryResponse fetchRemoteStatsSummary(String sessionToken, Long sinceMs, boolean allowRefresh) {
+        try {
+            return apiClient.fetchStatsSummary(sessionToken, sinceMs, null);
+        } catch (ApiClient.ApiException ex) {
+            if (ex.statusCode == 401 && allowRefresh) {
+                boolean refreshed = attemptRefresh(sessionToken);
+                if (refreshed) {
+                    String refreshedToken = config.sessionToken();
+                    if (refreshedToken != null && !refreshedToken.isEmpty()) {
+                        return fetchRemoteStatsSummary(refreshedToken, sinceMs, false);
+                    }
+                }
+                clearSession();
+            }
+        } catch (Exception ignored) {
+        }
+        return null;
+    }
+
+    private ApiClient.StatsItemsResponse fetchRemoteStatsItems(String sessionToken, Long sinceMs, StatsItemSort sort,
+        boolean allowRefresh) {
+        try {
+            return apiClient.fetchStatsItems(sessionToken, sinceMs, null, 200, sort);
+        } catch (ApiClient.ApiException ex) {
+            if (ex.statusCode == 401 && allowRefresh) {
+                boolean refreshed = attemptRefresh(sessionToken);
+                if (refreshed) {
+                    String refreshedToken = config.sessionToken();
+                    if (refreshedToken != null && !refreshedToken.isEmpty()) {
+                        return fetchRemoteStatsItems(refreshedToken, sinceMs, sort, false);
+                    }
+                }
+                clearSession();
+            }
+        } catch (Exception ignored) {
+        }
+        return null;
     }
 
     private void refreshPanelData() {
@@ -4122,7 +4199,34 @@ public class GeLifecyclePlugin extends Plugin {
         if (key == null || key.trim().isEmpty() || configManager == null || gson == null) {
             return null;
         }
-        String raw = configManager.getConfiguration("fliphub", "localTrades." + key);
+        String raw = configManager.getConfiguration("fliphub_dev", "localTrades." + key);
+        if (raw == null || raw.trim().isEmpty()) {
+            return null;
+        }
+        try {
+            Type type = new TypeToken<List<LocalTradeDelta>>() {}.getType();
+            return gson.fromJson(raw, type);
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    private List<LocalTradeDelta> readLegacyLocalTrades(List<String> keys, int index) {
+        if (keys == null || index < 0 || index >= keys.size()) {
+            return null;
+        }
+        return readLegacyLocalTrades(keys.get(index));
+    }
+
+    private List<LocalTradeDelta> readLegacyLocalTrades(String key) {
+        if (key == null || key.trim().isEmpty() || configManager == null || gson == null) {
+            return null;
+        }
+        Map<String, String> legacyCache = getLegacyLocalTradesCache();
+        String raw = legacyCache != null ? legacyCache.get(key.trim()) : null;
+        if (raw == null || raw.trim().isEmpty()) {
+            raw = configManager.getConfiguration(LEGACY_CONFIG_GROUP, "localTrades." + key);
+        }
         if (raw == null || raw.trim().isEmpty()) {
             return null;
         }
@@ -4242,6 +4346,7 @@ public class GeLifecyclePlugin extends Plugin {
         return bucket + "|" + delta.itemId + "|" + delta.isBuy + "|" + delta.deltaQty + "|" + delta.price;
     }
 
+
     private LocalStatsSnapshot buildLocalStatsSnapshot(long accountKey, Long sinceMs, StatsItemSort sort) {
         if (sinceMs == null) {
             if (accountKey == ACCOUNTWIDE_KEY) {
@@ -4297,154 +4402,76 @@ public class GeLifecyclePlugin extends Plugin {
     }
 
     private LocalStatsSnapshot buildAccountwideStatsSnapshot(Long sinceMs, StatsItemSort sort) {
-        Map<Integer, StatsItem> mergedItems = new HashMap<>();
-        long totalProfit = 0L;
-        long totalCost = 0L;
-        long totalQty = 0L;
-        long totalTax = 0L;
-        long totalActiveMs = 0L;
-        int totalCompleted = 0;
-        Long firstBuyTs = null;
-        Long lastSellTs = null;
-
-        Map<Long, String> profiles = loadProfilesFromDisk();
-        for (Long key : profiles.keySet()) {
-            if (key == null || key <= 0) {
-                continue;
-            }
-            ensureProfileLoaded(key);
-            LocalStatsSnapshot snapshot = buildLocalStatsSnapshotForAccount(key, sinceMs, sort);
-            if (snapshot == null || snapshot.summary == null) {
-                continue;
-            }
-            StatsSummary summary = snapshot.summary;
-            totalProfit += summary.total_profit_gp != null ? summary.total_profit_gp : 0L;
-            totalCost += summary.total_cost_gp != null ? summary.total_cost_gp : 0L;
-            totalQty += summary.total_qty != null ? summary.total_qty : 0L;
-            totalTax += summary.tax_paid_gp != null ? summary.tax_paid_gp : 0L;
-            totalActiveMs += summary.active_ms != null ? summary.active_ms : 0L;
-            totalCompleted += summary.fill_count != null ? summary.fill_count : 0;
-            if (summary.first_buy_ts_ms != null && (firstBuyTs == null || summary.first_buy_ts_ms < firstBuyTs)) {
-                firstBuyTs = summary.first_buy_ts_ms;
-            }
-            if (summary.last_sell_ts_ms != null && (lastSellTs == null || summary.last_sell_ts_ms > lastSellTs)) {
-                lastSellTs = summary.last_sell_ts_ms;
-            }
-
-            if (snapshot.items == null) {
-                continue;
-            }
-            for (StatsItem item : snapshot.items) {
-                if (item == null || item.item_id <= 0) {
-                    continue;
-                }
-                StatsItem merged = mergedItems.computeIfAbsent(item.item_id, keyItem -> {
-                    StatsItem next = new StatsItem();
-                    next.item_id = keyItem;
-                    next.item_name = item.item_name;
-                    next.total_profit_gp = 0L;
-                    next.total_cost_gp = 0L;
-                    next.total_qty = 0;
-                    next.fill_count = 0;
-                    next.last_sell_ts_ms = item.last_sell_ts_ms;
-                    return next;
-                });
-                long profit = item.total_profit_gp != null ? item.total_profit_gp : 0L;
-                long cost = item.total_cost_gp != null ? item.total_cost_gp : 0L;
-                int qty = item.total_qty != null ? item.total_qty : 0;
-                int fills = item.fill_count != null ? item.fill_count : 0;
-                merged.total_profit_gp = (merged.total_profit_gp != null ? merged.total_profit_gp : 0L) + profit;
-                merged.total_cost_gp = (merged.total_cost_gp != null ? merged.total_cost_gp : 0L) + cost;
-                merged.total_qty = (merged.total_qty != null ? merged.total_qty : 0) + qty;
-                merged.fill_count = (merged.fill_count != null ? merged.fill_count : 0) + fills;
-                if (merged.item_name == null || merged.item_name.trim().isEmpty()) {
-                    merged.item_name = item.item_name;
-                }
-                if (item.last_sell_ts_ms != null
-                    && (merged.last_sell_ts_ms == null || item.last_sell_ts_ms > merged.last_sell_ts_ms)) {
-                    merged.last_sell_ts_ms = item.last_sell_ts_ms;
-                }
-            }
-        }
-
-        List<StatsItem> items = new ArrayList<>(mergedItems.values());
-        StatsSummary summary = finalizeAccountwideSnapshot(items, sort, totalProfit, totalCost, totalQty, totalTax,
-            totalActiveMs, totalCompleted, firstBuyTs, lastSellTs);
-        return new LocalStatsSnapshot(summary, items);
+        List<LocalTradeDelta> merged = buildAccountwideDeltas();
+        return buildAccountwideSnapshotFromDeltas(merged, sinceMs, sort);
     }
 
     private LocalStatsSnapshot buildAccountwideStatsSnapshotFromCaches(StatsItemSort sort) {
-        Map<Integer, StatsItem> mergedItems = new HashMap<>();
-        long totalProfit = 0L;
-        long totalCost = 0L;
-        long totalQty = 0L;
-        long totalTax = 0L;
-        long totalActiveMs = 0L;
-        int totalCompleted = 0;
-        Long firstBuyTs = null;
-        Long lastSellTs = null;
+        List<LocalTradeDelta> merged = buildAccountwideDeltas();
+        return buildAccountwideSnapshotFromDeltas(merged, null, sort);
+    }
 
+    private LocalStatsSnapshot buildAccountwideSnapshotFromDeltas(List<LocalTradeDelta> deltas, Long sinceMs,
+        StatsItemSort sort) {
+        if (deltas == null || deltas.isEmpty()) {
+            return new LocalStatsSnapshot(new StatsSummary(), new ArrayList<>());
+        }
+        LocalStatsCache cache = new LocalStatsCache();
+        cache.rebuild(deltas);
+        LocalStatsSnapshot snapshot = cache.buildSnapshotSince(sinceMs);
+        if (snapshot == null) {
+            return new LocalStatsSnapshot(new StatsSummary(), new ArrayList<>());
+        }
+        List<StatsItem> items = snapshot.items != null ? snapshot.items : new ArrayList<>();
+        hydrateLocalItemNames(items);
+        items.sort(buildLocalStatsComparator(sort));
+        return new LocalStatsSnapshot(snapshot.summary, items);
+    }
+
+    private List<LocalTradeDelta> buildAccountwideDeltas() {
         Map<Long, String> profiles = loadProfilesFromDisk();
+        if (profiles == null || profiles.isEmpty()) {
+            return new ArrayList<>();
+        }
+        List<LocalTradeDelta> merged = new ArrayList<>();
+        Set<String> seen = new HashSet<>();
         for (Long key : profiles.keySet()) {
             if (key == null || key <= 0) {
                 continue;
             }
             ensureProfileLoaded(key);
-            LocalStatsCache cache = getOrBuildStatsCache(key);
-            if (cache == null) {
+            List<LocalTradeDelta> deltas = null;
+            synchronized (localStatsLock) {
+                List<LocalTradeDelta> snapshot = localTradeDeltasByAccount.get(key);
+                if (snapshot != null && !snapshot.isEmpty()) {
+                    deltas = new ArrayList<>(snapshot);
+                }
+            }
+            if (deltas == null) {
+                ProfileData data = readProfileData(key);
+                deltas = data != null ? data.deltas : null;
+            }
+            if (deltas == null || deltas.isEmpty()) {
                 continue;
             }
-            StatsSummary summary = cache.getSummary();
-            totalProfit += summary.total_profit_gp != null ? summary.total_profit_gp : 0L;
-            totalCost += summary.total_cost_gp != null ? summary.total_cost_gp : 0L;
-            totalQty += summary.total_qty != null ? summary.total_qty : 0L;
-            totalTax += summary.tax_paid_gp != null ? summary.tax_paid_gp : 0L;
-            totalActiveMs += summary.active_ms != null ? summary.active_ms : 0L;
-            totalCompleted += summary.fill_count != null ? summary.fill_count : 0;
-            if (summary.first_buy_ts_ms != null && (firstBuyTs == null || summary.first_buy_ts_ms < firstBuyTs)) {
-                firstBuyTs = summary.first_buy_ts_ms;
-            }
-            if (summary.last_sell_ts_ms != null && (lastSellTs == null || summary.last_sell_ts_ms > lastSellTs)) {
-                lastSellTs = summary.last_sell_ts_ms;
-            }
-
-            for (StatsItem item : cache.getItems()) {
-                if (item == null || item.item_id <= 0) {
+            for (LocalTradeDelta delta : deltas) {
+                if (delta == null) {
                     continue;
                 }
-                StatsItem merged = mergedItems.computeIfAbsent(item.item_id, keyItem -> {
-                    StatsItem next = new StatsItem();
-                    next.item_id = keyItem;
-                    next.item_name = item.item_name;
-                    next.total_profit_gp = 0L;
-                    next.total_cost_gp = 0L;
-                    next.total_qty = 0;
-                    next.fill_count = 0;
-                    next.last_sell_ts_ms = item.last_sell_ts_ms;
-                    return next;
-                });
-                long profit = item.total_profit_gp != null ? item.total_profit_gp : 0L;
-                long cost = item.total_cost_gp != null ? item.total_cost_gp : 0L;
-                int qty = item.total_qty != null ? item.total_qty : 0;
-                int fills = item.fill_count != null ? item.fill_count : 0;
-                merged.total_profit_gp = (merged.total_profit_gp != null ? merged.total_profit_gp : 0L) + profit;
-                merged.total_cost_gp = (merged.total_cost_gp != null ? merged.total_cost_gp : 0L) + cost;
-                merged.total_qty = (merged.total_qty != null ? merged.total_qty : 0) + qty;
-                merged.fill_count = (merged.fill_count != null ? merged.fill_count : 0) + fills;
-                if (merged.item_name == null || merged.item_name.trim().isEmpty()) {
-                    merged.item_name = item.item_name;
-                }
-                if (item.last_sell_ts_ms != null
-                    && (merged.last_sell_ts_ms == null || item.last_sell_ts_ms > merged.last_sell_ts_ms)) {
-                    merged.last_sell_ts_ms = item.last_sell_ts_ms;
+                if (seen.add(buildLocalTradeSignature(delta))) {
+                    merged.add(delta);
                 }
             }
         }
-
-        List<StatsItem> items = new ArrayList<>(mergedItems.values());
-        StatsSummary summary = finalizeAccountwideSnapshot(items, sort, totalProfit, totalCost, totalQty, totalTax,
-            totalActiveMs, totalCompleted, firstBuyTs, lastSellTs);
-        return new LocalStatsSnapshot(summary, items);
+        if (merged.isEmpty()) {
+            return merged;
+        }
+        merged.sort(Comparator.comparingLong(delta -> delta != null ? delta.tsClientMs : 0L));
+        if (merged.size() > MAX_LOCAL_TRADES) {
+            int trim = merged.size() - MAX_LOCAL_TRADES;
+            merged.subList(0, trim).clear();
+        }
+        return merged;
     }
 
     private StatsSummary finalizeAccountwideSnapshot(List<StatsItem> items,
